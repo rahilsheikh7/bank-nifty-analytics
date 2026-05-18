@@ -1,0 +1,107 @@
+# =============================================================================
+# BANK NIFTY SUPERTREND + EMA STANDALONE BACKTEST CONFIGURATION
+# All settings live inside KITE so this folder can be moved and run standalone.
+# =============================================================================
+
+strategy:
+  name: "Bank Nifty EMA Supertrend Strategy"
+  version: "1.0.0"
+  description: "Standalone Bank Nifty backtest using local 1-minute continuous CSV"
+
+long_supertrend_entry:
+  atr_length: 12
+  multiplier: 4
+
+long_supertrend_exit:
+  atr_length: 12
+  multiplier: 4
+
+short_supertrend_entry:
+  atr_length: 12
+  multiplier: 4
+
+short_supertrend_exit:
+  atr_length: 12
+  multiplier: 4
+
+long_supertrend:
+  atr_length: 12
+  multiplier: 4
+
+short_supertrend:
+  atr_length: 12
+  multiplier: 5
+
+supertrend:
+  atr_length: 12
+  multiplier: 4
+
+ema:
+  length: 200
+  # Dynamic EMA timeframe. Examples: "10m", "20m", "30m", "1H".
+  timeframe: "1H"
+
+timeframes:
+  # Primary bar size for Supertrend, ADX, volume MA, SL/TP, and backtest steps.
+  # May be placed here or under strategy: (root wins if both exist).
+  primary: "10m"
+  # For hour-based ``ema.timeframe`` (e.g. 1H): label hourly buckets at …:45 (09:45, 10:45, …).
+  # Set to null to use legacy 15m-offset hourly bars instead.
+  hourly_bar_end_minute: 45
+
+long_risk:
+  stop_loss_pct: 0.35
+  take_profit_pct: 4
+
+short_risk:
+  stop_loss_pct: 0.35
+  take_profit_pct: 4
+
+risk:
+  stop_loss_pct: 0.35
+  take_profit_pct: 4
+
+long_adx:
+  use_adx: true
+  di_length: 14
+  adx_smoothing: 14
+  threshold: 24
+  consecutive_candles: 5
+
+short_adx:
+  use_adx: true
+  di_length: 14
+  adx_smoothing: 14
+  threshold: 24
+  consecutive_candles: 5
+
+adx:
+  use_adx: true
+  di_length: 14
+  adx_smoothing: 14
+  threshold: 24
+  consecutive_candles: 5
+
+volume_check: false
+volume_ma_period: 20
+volume_candle_lookahead: 3
+
+execution:
+  pyramiding: 0
+  process_orders_on_close: true
+  initial_capital: 100000
+  independent_books: true
+  contracts: 1
+
+contract:
+  name: "BANKNIFTY continuous"
+  lot_size: 1
+  point_value: 1
+
+costs:
+  commission_per_trade: 0
+  slippage_points: 0
+
+bar_close:
+  wait_for_confirmation: true
+  lookahead_protection: true

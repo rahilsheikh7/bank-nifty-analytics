@@ -1,0 +1,8 @@
+.env
+*.parquet
+__pycache__/
+.venv/
+venv/
+results/
+nifty/
+nifty.zip
