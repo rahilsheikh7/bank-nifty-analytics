@@ -30,7 +30,7 @@ long_supertrend:
 
 short_supertrend:
   atr_length: 12
-  multiplier: 5
+  multiplier: 4
 
 supertrend:
   atr_length: 12
@@ -45,9 +45,9 @@ timeframes:
   # Primary bar size for Supertrend, ADX, volume MA, SL/TP, and backtest steps.
   # May be placed here or under strategy: (root wins if both exist).
   primary: "10m"
-  # For hour-based ``ema.timeframe`` (e.g. 1H): label hourly buckets at …:45 (09:45, 10:45, …).
-  # Set to null to use legacy 15m-offset hourly bars instead.
-  hourly_bar_end_minute: 45
+  # For hour-based ``ema.timeframe`` (e.g. 1H): IST hourly close at …:15 (09:15, 10:15, …).
+  # Set to null to use legacy 15m-offset hourly bars without right-edge labels.
+  hourly_bar_end_minute: 15
 
 long_risk:
   stop_loss_pct: 0.35
@@ -62,21 +62,21 @@ risk:
   take_profit_pct: 4
 
 long_adx:
-  use_adx: true
+  use_adx: false
   di_length: 14
   adx_smoothing: 14
   threshold: 24
   consecutive_candles: 5
 
 short_adx:
-  use_adx: true
+  use_adx: false
   di_length: 14
   adx_smoothing: 14
   threshold: 24
   consecutive_candles: 5
 
 adx:
-  use_adx: true
+  use_adx: false
   di_length: 14
   adx_smoothing: 14
   threshold: 24

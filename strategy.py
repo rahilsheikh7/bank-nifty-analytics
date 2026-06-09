@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import time
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+# NSE cash session opens 09:15 IST; first 1H candle completes at 10:15.
+SESSION_FIRST_HOUR_CLOSE = time(10, 15)
 
 
 class SignalType(Enum):
@@ -79,12 +83,20 @@ class StrategyState:
     prev_st_direction: int = 0
     pending_long_ema_wait: bool = False
     pending_short_ema_wait: bool = False
+    pending_first_hour_long: bool = False
+    pending_first_hour_short: bool = False
+    pending_first_hour_trigger_long: str = ""
+    pending_first_hour_trigger_short: str = ""
+    pending_first_hour_deferred_long: Optional[Dict[str, Any]] = None
+    pending_first_hour_deferred_short: Optional[Dict[str, Any]] = None
     pending_adx_long: bool = False
     pending_adx_short: bool = False
     adx_wait_bars_left_long: int = 0
     adx_wait_bars_left_short: int = 0
     adx_wait_trigger_long: str = ""
     adx_wait_trigger_short: str = ""
+    deferred_ema_cross_long: Optional[Dict[str, Any]] = None
+    deferred_ema_cross_short: Optional[Dict[str, Any]] = None
     pending_volume_long: bool = False
     pending_volume_short: bool = False
     volume_wait_bars_left_long: int = 0
@@ -110,6 +122,7 @@ class StateManager:
             self.state.traded_in_bull_trend = False
             self.state.traded_in_bear_trend = False
             self.state.pending_short_ema_wait = False
+            self.clear_pending_first_hour_short()
             self.clear_adx_wait_long()
             self.clear_adx_wait_short()
             self.clear_volume_wait_long()
@@ -118,6 +131,7 @@ class StateManager:
             self.state.traded_in_bear_trend = False
             self.state.traded_in_bull_trend = False
             self.state.pending_long_ema_wait = False
+            self.clear_pending_first_hour_long()
             self.clear_adx_wait_long()
             self.clear_adx_wait_short()
             self.clear_volume_wait_long()
@@ -136,6 +150,26 @@ class StateManager:
     def clear_pending_short_ema_wait(self) -> None:
         self.state.pending_short_ema_wait = False
 
+    def set_pending_first_hour_long(self, trigger: str, deferred: Optional[Dict[str, Any]] = None) -> None:
+        self.state.pending_first_hour_long = True
+        self.state.pending_first_hour_trigger_long = trigger
+        self.state.pending_first_hour_deferred_long = dict(deferred) if deferred else None
+
+    def clear_pending_first_hour_long(self) -> None:
+        self.state.pending_first_hour_long = False
+        self.state.pending_first_hour_trigger_long = ""
+        self.state.pending_first_hour_deferred_long = None
+
+    def set_pending_first_hour_short(self, trigger: str, deferred: Optional[Dict[str, Any]] = None) -> None:
+        self.state.pending_first_hour_short = True
+        self.state.pending_first_hour_trigger_short = trigger
+        self.state.pending_first_hour_deferred_short = dict(deferred) if deferred else None
+
+    def clear_pending_first_hour_short(self) -> None:
+        self.state.pending_first_hour_short = False
+        self.state.pending_first_hour_trigger_short = ""
+        self.state.pending_first_hour_deferred_short = None
+
     def set_adx_wait_long(self, bars: int, trigger: str) -> None:
         self.state.pending_adx_long = True
         self.state.adx_wait_bars_left_long = int(bars)
@@ -150,11 +184,19 @@ class StateManager:
         self.state.pending_adx_long = False
         self.state.adx_wait_bars_left_long = 0
         self.state.adx_wait_trigger_long = ""
+        self.state.deferred_ema_cross_long = None
 
     def clear_adx_wait_short(self) -> None:
         self.state.pending_adx_short = False
         self.state.adx_wait_bars_left_short = 0
         self.state.adx_wait_trigger_short = ""
+        self.state.deferred_ema_cross_short = None
+
+    def set_deferred_ema_cross_long(self, payload: Dict[str, Any]) -> None:
+        self.state.deferred_ema_cross_long = dict(payload)
+
+    def set_deferred_ema_cross_short(self, payload: Dict[str, Any]) -> None:
+        self.state.deferred_ema_cross_short = dict(payload)
 
     def decrement_adx_wait_long(self) -> None:
         self.state.adx_wait_bars_left_long -= 1
@@ -212,11 +254,13 @@ class StateManager:
         if is_long:
             self.state.traded_in_bull_trend = True
             self.state.pending_long_ema_wait = False
+            self.clear_pending_first_hour_long()
             self.clear_adx_wait_long()
             self.clear_volume_wait_long()
         else:
             self.state.traded_in_bear_trend = True
             self.state.pending_short_ema_wait = False
+            self.clear_pending_first_hour_short()
             self.clear_adx_wait_short()
             self.clear_volume_wait_short()
 
@@ -271,6 +315,7 @@ class SignalEngine:
         adx_threshold_short: float = 24.0,
         volume_check: bool = False,
         volume_candle_lookahead: int = 1,
+        ema_timeframe: str = "1H",
     ):
         self.sl_pct_long = float(sl_pct_long)
         self.tp_pct_long = float(tp_pct_long)
@@ -327,6 +372,183 @@ class SignalEngine:
                 return ExitSignal(ExitType.ST_FLIP, bar.name, close, entry_price, entry_price - close)
         return None
 
+    @staticmethod
+    def _ema_period_close_bar(bar: pd.Series) -> bool:
+        return bool(bar.get("is_ema_period_close", bar.get("is_new_1h_candle", False)))
+
+    @staticmethod
+    def _before_first_hour_close(timestamp: pd.Timestamp) -> bool:
+        return pd.Timestamp(timestamp).time() < SESSION_FIRST_HOUR_CLOSE
+
+    @staticmethod
+    def _is_first_hour_close_bar(bar: pd.Series) -> bool:
+        ts = pd.Timestamp(bar.name)
+        return (ts.hour, ts.minute) == (SESSION_FIRST_HOUR_CLOSE.hour, SESSION_FIRST_HOUR_CLOSE.minute)
+
+    @staticmethod
+    def _ema_side_ok_long(bar: pd.Series, confirmed_valid: bool, close_confirmed: Any, ema_confirmed: Any) -> bool:
+        return confirmed_valid and float(close_confirmed) > float(ema_confirmed)
+
+    @staticmethod
+    def _ema_side_ok_short(bar: pd.Series, confirmed_valid: bool, close_confirmed: Any, ema_confirmed: Any) -> bool:
+        return confirmed_valid and float(close_confirmed) < float(ema_confirmed)
+
+    @staticmethod
+    def _hour_boundary_entry_price(bar: pd.Series) -> float:
+        entry_px = bar.get("close_1m_hour_boundary", np.nan)
+        if pd.isna(entry_px):
+            entry_px = bar.get("close_1h", bar["close"])
+        return float(entry_px)
+
+    @staticmethod
+    def _hour_boundary_entry_time(bar: pd.Series) -> pd.Timestamp:
+        period_end = bar.get("ema_period_end", bar.name)
+        return pd.Timestamp(period_end) if pd.notna(period_end) else bar.name
+
+    def _defer_entry_until_first_hour(
+        self,
+        bar: pd.Series,
+        signal: Optional[Signal],
+        updates: Dict[str, Any],
+        *,
+        is_long: bool,
+        trigger: str,
+        deferred: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[Signal], Dict[str, Any]]:
+        if signal is None or not self._before_first_hour_close(bar.name):
+            return signal, updates
+        key = "set_pending_first_hour_long" if is_long else "set_pending_first_hour_short"
+        updates[key] = {"trigger": trigger, "deferred": deferred}
+        return None, updates
+
+    def _evaluate_first_hour_open_entry(
+        self,
+        bar: pd.Series,
+        *,
+        traded_in_bull_trend: bool,
+        traded_in_bear_trend: bool,
+        pending_first_hour_long: bool,
+        pending_first_hour_short: bool,
+        pending_first_hour_trigger_long: str,
+        pending_first_hour_trigger_short: str,
+        pending_first_hour_deferred_long: Optional[Dict[str, Any]],
+        pending_first_hour_deferred_short: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[Signal], Dict[str, Any]]:
+        updates: Dict[str, Any] = {}
+        if not self._is_first_hour_close_bar(bar):
+            return None, updates
+
+        close_confirmed = bar.get("close_1h_cross", bar.get("close_1h", np.nan))
+        ema_confirmed = bar.get("ema_1h_cross", bar.get("ema_1h", np.nan))
+        confirmed_valid = pd.notna(close_confirmed) and pd.notna(ema_confirmed)
+        st_bull_long = bool(bar.get("st_bull_long", False))
+        st_bear_short = bool(bar.get("st_bear_short", False))
+        adx_ok_long = (not self.use_adx_long) or bool(
+            bar.get("adx_above_threshold_long", bar.get("adx_above_threshold", False))
+        )
+        adx_ok_short = (not self.use_adx_short) or bool(
+            bar.get("adx_above_threshold_short", bar.get("adx_above_threshold", False))
+        )
+
+        if pending_first_hour_long and st_bull_long and not traded_in_bull_trend:
+            trigger = pending_first_hour_trigger_long or "st_flip"
+            if self._ema_side_ok_long(bar, confirmed_valid, close_confirmed, ema_confirmed):
+                updates["clear_pending_first_hour_long"] = True
+                if adx_ok_long:
+                    if trigger == "ema_cross":
+                        if pending_first_hour_deferred_long:
+                            deferred = pending_first_hour_deferred_long
+                            return (
+                                self._signal(
+                                    bar,
+                                    SignalType.BUY,
+                                    "ema_cross",
+                                    entry_price=float(deferred["price"]),
+                                    timestamp=self._hour_boundary_entry_time(bar),
+                                    ema_1h=float(deferred["ema_1h"]),
+                                    close_1h=float(deferred["close_1h"]),
+                                ),
+                                updates,
+                            )
+                        return self._ema_cross_signal(bar, SignalType.BUY), updates
+                    entry_time = self._hour_boundary_entry_time(bar)
+                    entry_price = self._hour_boundary_entry_price(bar)
+                    return (
+                        self._signal(
+                            bar,
+                            SignalType.BUY,
+                            trigger,
+                            entry_price=entry_price,
+                            timestamp=entry_time,
+                        ),
+                        updates,
+                    )
+                updates["set_adx_wait_long"] = {"bars": self.adx_wait_bars_long, "trigger": trigger}
+            else:
+                updates["clear_pending_first_hour_long"] = True
+                updates["set_pending_long_ema_wait"] = True
+
+        if pending_first_hour_short and st_bear_short and not traded_in_bear_trend:
+            trigger = pending_first_hour_trigger_short or "st_flip"
+            if self._ema_side_ok_short(bar, confirmed_valid, close_confirmed, ema_confirmed):
+                updates["clear_pending_first_hour_short"] = True
+                if adx_ok_short:
+                    if trigger == "ema_cross":
+                        if pending_first_hour_deferred_short:
+                            deferred = pending_first_hour_deferred_short
+                            return (
+                                self._signal(
+                                    bar,
+                                    SignalType.SELL,
+                                    "ema_cross",
+                                    entry_price=float(deferred["price"]),
+                                    timestamp=self._hour_boundary_entry_time(bar),
+                                    ema_1h=float(deferred["ema_1h"]),
+                                    close_1h=float(deferred["close_1h"]),
+                                ),
+                                updates,
+                            )
+                        return self._ema_cross_signal(bar, SignalType.SELL), updates
+                    entry_time = self._hour_boundary_entry_time(bar)
+                    entry_price = self._hour_boundary_entry_price(bar)
+                    return (
+                        self._signal(
+                            bar,
+                            SignalType.SELL,
+                            trigger,
+                            entry_price=entry_price,
+                            timestamp=entry_time,
+                        ),
+                        updates,
+                    )
+                updates["set_adx_wait_short"] = {"bars": self.adx_wait_bars_short, "trigger": trigger}
+            else:
+                updates["clear_pending_first_hour_short"] = True
+                updates["set_pending_short_ema_wait"] = True
+
+        return None, updates
+
+    @staticmethod
+    def _ema_cross_entry_fields(bar: pd.Series) -> Tuple[pd.Timestamp, float, float, float]:
+        """
+        EMA-cross entry at the hourly close that confirms the cross.
+
+        Entry timestamp = that candle's close (``ema_period_end``, e.g. 13:15) and
+        entry price = the close of the *same* candle (the :14 one-minute close,
+        e.g. 13:14). This is identical in form to the first-hour open entry, so
+        every entry is "exact close time + that candle's close" — the next hour is
+        never used.
+        """
+        period_end = bar.get("ema_period_end", bar.name)
+        entry_time = pd.Timestamp(period_end) if pd.notna(period_end) else bar.name
+        entry_px = bar.get("close_1m_hour_boundary", np.nan)
+        if pd.isna(entry_px):
+            entry_px = bar.get("close_1h", bar["close"])
+        price = float(entry_px)
+        ema_1h = float(bar.get("ema_1h", np.nan))
+        close_1h = float(bar.get("close_1h", np.nan))
+        return entry_time, price, ema_1h, close_1h
+
     def _signal(
         self,
         bar: pd.Series,
@@ -334,35 +556,89 @@ class SignalEngine:
         trigger: str,
         *,
         entry_price: Optional[float] = None,
+        timestamp: Optional[pd.Timestamp] = None,
+        ema_1h: Optional[float] = None,
+        close_1h: Optional[float] = None,
     ) -> Signal:
         is_long = signal_type == SignalType.BUY
         if entry_price is not None:
             price = float(entry_price)
-        elif trigger == "ema_cross":
-            c1h = bar.get("close_1h", np.nan)
-            price = float(c1h) if pd.notna(c1h) else float(bar["close"])
         else:
             price = float(bar["close"])
         st_key = "supertrend_long" if is_long else "supertrend_short"
         dir_key = "direction_long" if is_long else "direction_short"
         return Signal(
             signal_type=signal_type,
-            timestamp=bar.name,
+            timestamp=timestamp if timestamp is not None else bar.name,
             price=price,
             supertrend_value=float(bar.get(st_key, np.nan)),
             supertrend_direction=int(bar.get(dir_key, 0)),
-            ema_1h=float(bar.get("ema_1h", np.nan)),
-            close_1h=float(bar.get("close_1h", np.nan)),
+            ema_1h=float(ema_1h if ema_1h is not None else bar.get("ema_1h", np.nan)),
+            close_1h=float(close_1h if close_1h is not None else bar.get("close_1h", np.nan)),
             trigger=trigger,
             volume_at_entry=float(bar["volume"]) if pd.notna(bar.get("volume", np.nan)) else None,
             volume_ma_at_entry=float(bar["volume_ma"]) if pd.notna(bar.get("volume_ma", np.nan)) else None,
         )
+
+    def _ema_cross_signal(
+        self,
+        bar: pd.Series,
+        signal_type: SignalType,
+        *,
+        deferred: Optional[Dict[str, Any]] = None,
+    ) -> Signal:
+        if deferred:
+            ts = deferred["timestamp"]
+            price = float(deferred["price"])
+            ema_1h = float(deferred["ema_1h"])
+            close_1h = float(deferred["close_1h"])
+        else:
+            ts, price, ema_1h, close_1h = self._ema_cross_entry_fields(bar)
+        return self._signal(
+            bar,
+            signal_type,
+            "ema_cross",
+            entry_price=price,
+            timestamp=ts,
+            ema_1h=ema_1h,
+            close_1h=close_1h,
+        )
+
+    def _deferred_ema_cross_payload(self, bar: pd.Series) -> Dict[str, Any]:
+        ts, price, ema_1h, close_1h = self._ema_cross_entry_fields(bar)
+        return {
+            "timestamp": ts,
+            "price": price,
+            "ema_1h": ema_1h,
+            "close_1h": close_1h,
+        }
 
     @staticmethod
     def _row_volume_confirms(row: pd.Series) -> bool:
         volume = row.get("volume", np.nan)
         volume_ma = row.get("volume_ma", np.nan)
         return pd.notna(volume) and pd.notna(volume_ma) and float(volume_ma) > 0 and float(volume) > float(volume_ma)
+
+    def _return_gated_entry(
+        self,
+        bar: pd.Series,
+        signal: Signal,
+        updates: Dict[str, Any],
+        volume_window: Optional[pd.DataFrame],
+        *,
+        is_long: bool,
+        trigger: str,
+        deferred: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[Signal], Dict[str, Any]]:
+        signal, updates = self._defer_entry_until_first_hour(
+            bar,
+            signal,
+            updates,
+            is_long=is_long,
+            trigger=trigger,
+            deferred=deferred,
+        )
+        return self._finalize_volume(signal, updates, volume_window)
 
     def _finalize_volume(
         self,
@@ -381,6 +657,9 @@ class SignalEngine:
                     signal.signal_type,
                     signal.trigger,
                     entry_price=signal.price,
+                    timestamp=signal.timestamp,
+                    ema_1h=signal.ema_1h,
+                    close_1h=signal.close_1h,
                 )
                 return adjusted, updates
         return None, {}
@@ -393,12 +672,20 @@ class SignalEngine:
         traded_in_bear_trend: bool,
         pending_long_ema_wait: bool = False,
         pending_short_ema_wait: bool = False,
+        pending_first_hour_long: bool = False,
+        pending_first_hour_short: bool = False,
+        pending_first_hour_trigger_long: str = "",
+        pending_first_hour_trigger_short: str = "",
+        pending_first_hour_deferred_long: Optional[Dict[str, Any]] = None,
+        pending_first_hour_deferred_short: Optional[Dict[str, Any]] = None,
         pending_adx_long: bool = False,
         pending_adx_short: bool = False,
         adx_wait_bars_left_long: int = 0,
         adx_wait_bars_left_short: int = 0,
         adx_wait_trigger_long: str = "",
         adx_wait_trigger_short: str = "",
+        deferred_ema_cross_long: Optional[Dict[str, Any]] = None,
+        deferred_ema_cross_short: Optional[Dict[str, Any]] = None,
         volume_window: Optional[pd.DataFrame] = None,
     ) -> Tuple[Optional[Signal], Dict[str, Any]]:
         updates: Dict[str, Any] = {}
@@ -418,20 +705,35 @@ class SignalEngine:
         ema_confirmed = bar.get("ema_1h_cross", bar.get("ema_1h", np.nan))
         confirmed_valid = pd.notna(close_confirmed) and pd.notna(ema_confirmed)
 
-        close_h = bar.get("close_1h", np.nan)
-        ema_h = bar.get("ema_1h", np.nan)
-        confirmed_hour = pd.notna(close_h) and pd.notna(ema_h)
-        is_new_ema_candle = bool(bar.get("is_new_1h_candle", False))
-        crossed_bull_hour = confirmed_hour and is_new_ema_candle and float(close_h) > float(ema_h)
-        crossed_bear_hour = confirmed_hour and is_new_ema_candle and float(close_h) < float(ema_h)
+        is_ema_period_close = self._ema_period_close_bar(bar)
+        ema_bull_cross = bool(bar.get("ema_bull_cross", False))
+        ema_bear_cross = bool(bar.get("ema_bear_cross", False))
 
         adx_above_long = bool(bar.get("adx_above_threshold_long", bar.get("adx_above_threshold", False)))
         adx_above_short = bool(bar.get("adx_above_threshold_short", bar.get("adx_above_threshold", False)))
         adx_ok_long = (not self.use_adx_long) or adx_above_long
         adx_ok_short = (not self.use_adx_short) or adx_above_short
 
+        first_hour_signal, first_hour_updates = self._evaluate_first_hour_open_entry(
+            bar,
+            traded_in_bull_trend=traded_in_bull_trend,
+            traded_in_bear_trend=traded_in_bear_trend,
+            pending_first_hour_long=pending_first_hour_long,
+            pending_first_hour_short=pending_first_hour_short,
+            pending_first_hour_trigger_long=pending_first_hour_trigger_long,
+            pending_first_hour_trigger_short=pending_first_hour_trigger_short,
+            pending_first_hour_deferred_long=pending_first_hour_deferred_long,
+            pending_first_hour_deferred_short=pending_first_hour_deferred_short,
+        )
+        updates.update(first_hour_updates)
+        if first_hour_signal is not None:
+            return self._finalize_volume(first_hour_signal, updates, volume_window)
+
         if st_bull_flip_long and not traded_in_bull_trend:
-            if confirmed_valid and float(close_confirmed) > float(ema_confirmed):
+            if self._ema_side_ok_long(bar, confirmed_valid, close_confirmed, ema_confirmed):
+                if self._before_first_hour_close(bar.name):
+                    updates["set_pending_first_hour_long"] = {"trigger": "st_flip", "deferred": None}
+                    return None, updates
                 if adx_ok_long:
                     return self._finalize_volume(
                         self._signal(bar, SignalType.BUY, "st_flip"), updates, volume_window
@@ -442,7 +744,10 @@ class SignalEngine:
             return None, updates
 
         if st_bear_flip_short and not traded_in_bear_trend:
-            if confirmed_valid and float(close_confirmed) < float(ema_confirmed):
+            if self._ema_side_ok_short(bar, confirmed_valid, close_confirmed, ema_confirmed):
+                if self._before_first_hour_close(bar.name):
+                    updates["set_pending_first_hour_short"] = {"trigger": "st_flip", "deferred": None}
+                    return None, updates
                 if adx_ok_short:
                     return self._finalize_volume(
                         self._signal(bar, SignalType.SELL, "st_flip"), updates, volume_window
@@ -453,14 +758,50 @@ class SignalEngine:
             return None, updates
 
         if pending_adx_long and st_bull_long and not traded_in_bull_trend:
+            trigger = adx_wait_trigger_long or "st_flip"
+            if trigger == "ema_cross" and deferred_ema_cross_long:
+                if adx_ok_long:
+                    updates["clear_adx_wait_long"] = True
+                    updates["clear_pending_long_ema_wait"] = True
+                    return self._return_gated_entry(
+                        bar,
+                        self._ema_cross_signal(
+                            bar, SignalType.BUY, deferred=deferred_ema_cross_long
+                        ),
+                        updates,
+                        volume_window,
+                        is_long=True,
+                        trigger="ema_cross",
+                        deferred=deferred_ema_cross_long,
+                    )
+                if adx_wait_bars_left_long <= 1:
+                    updates["clear_adx_wait_long"] = True
+                else:
+                    updates["decrement_adx_wait_long"] = True
+                return None, updates
             if adx_ok_long:
-                trigger = adx_wait_trigger_long or "st_flip"
                 updates["clear_adx_wait_long"] = True
-                entry_px = float(bar["close"]) if trigger == "ema_cross" else None
-                return self._finalize_volume(
-                    self._signal(bar, SignalType.BUY, trigger, entry_price=entry_px),
+                if trigger == "ema_cross":
+                    return self._return_gated_entry(
+                        bar,
+                        self._ema_cross_signal(
+                            bar,
+                            SignalType.BUY,
+                            deferred=deferred_ema_cross_long,
+                        ),
+                        updates,
+                        volume_window,
+                        is_long=True,
+                        trigger="ema_cross",
+                        deferred=deferred_ema_cross_long,
+                    )
+                return self._return_gated_entry(
+                    bar,
+                    self._signal(bar, SignalType.BUY, trigger),
                     updates,
                     volume_window,
+                    is_long=True,
+                    trigger=trigger,
                 )
             if adx_wait_bars_left_long <= 1:
                 updates["clear_adx_wait_long"] = True
@@ -469,14 +810,50 @@ class SignalEngine:
             return None, updates
 
         if pending_adx_short and st_bear_short and not traded_in_bear_trend:
+            trigger = adx_wait_trigger_short or "st_flip"
+            if trigger == "ema_cross" and deferred_ema_cross_short:
+                if adx_ok_short:
+                    updates["clear_adx_wait_short"] = True
+                    updates["clear_pending_short_ema_wait"] = True
+                    return self._return_gated_entry(
+                        bar,
+                        self._ema_cross_signal(
+                            bar, SignalType.SELL, deferred=deferred_ema_cross_short
+                        ),
+                        updates,
+                        volume_window,
+                        is_long=False,
+                        trigger="ema_cross",
+                        deferred=deferred_ema_cross_short,
+                    )
+                if adx_wait_bars_left_short <= 1:
+                    updates["clear_adx_wait_short"] = True
+                else:
+                    updates["decrement_adx_wait_short"] = True
+                return None, updates
             if adx_ok_short:
-                trigger = adx_wait_trigger_short or "st_flip"
                 updates["clear_adx_wait_short"] = True
-                entry_px = float(bar["close"]) if trigger == "ema_cross" else None
-                return self._finalize_volume(
-                    self._signal(bar, SignalType.SELL, trigger, entry_price=entry_px),
+                if trigger == "ema_cross":
+                    return self._return_gated_entry(
+                        bar,
+                        self._ema_cross_signal(
+                            bar,
+                            SignalType.SELL,
+                            deferred=deferred_ema_cross_short,
+                        ),
+                        updates,
+                        volume_window,
+                        is_long=False,
+                        trigger="ema_cross",
+                        deferred=deferred_ema_cross_short,
+                    )
+                return self._return_gated_entry(
+                    bar,
+                    self._signal(bar, SignalType.SELL, trigger),
                     updates,
                     volume_window,
+                    is_long=False,
+                    trigger=trigger,
                 )
             if adx_wait_bars_left_short <= 1:
                 updates["clear_adx_wait_short"] = True
@@ -484,22 +861,40 @@ class SignalEngine:
                 updates["decrement_adx_wait_short"] = True
             return None, updates
 
+        ema_long_confirmed = ema_bull_cross or self._ema_side_ok_long(
+            bar, confirmed_valid, close_confirmed, ema_confirmed
+        )
+        ema_short_confirmed = ema_bear_cross or self._ema_side_ok_short(
+            bar, confirmed_valid, close_confirmed, ema_confirmed
+        )
+
         if (
             pending_long_ema_wait
             and st_bull_long
             and not traded_in_bull_trend
-            and is_new_ema_candle
-            and (bool(bar.get("ema_bull_cross", False)) or crossed_bull_hour)
+            and is_ema_period_close
+            and ema_long_confirmed
         ):
+            if self._before_first_hour_close(bar.name):
+                updates["clear_pending_long_ema_wait"] = True
+                updates["set_pending_first_hour_long"] = {
+                    "trigger": "ema_cross",
+                    "deferred": self._deferred_ema_cross_payload(bar),
+                }
+                return None, updates
             if adx_ok_long:
                 updates["clear_pending_long_ema_wait"] = True
-                entry_px = float(close_h) if confirmed_hour else float(bar["close"])
-                return self._finalize_volume(
-                    self._signal(bar, SignalType.BUY, "ema_cross", entry_price=entry_px),
+                return self._return_gated_entry(
+                    bar,
+                    self._ema_cross_signal(bar, SignalType.BUY),
                     updates,
                     volume_window,
+                    is_long=True,
+                    trigger="ema_cross",
+                    deferred=self._deferred_ema_cross_payload(bar),
                 )
             updates["clear_pending_long_ema_wait"] = True
+            updates["set_deferred_ema_cross_long"] = self._deferred_ema_cross_payload(bar)
             updates["set_adx_wait_long"] = {"bars": self.adx_wait_bars_long, "trigger": "ema_cross"}
             return None, updates
 
@@ -507,18 +902,29 @@ class SignalEngine:
             pending_short_ema_wait
             and st_bear_short
             and not traded_in_bear_trend
-            and is_new_ema_candle
-            and (bool(bar.get("ema_bear_cross", False)) or crossed_bear_hour)
+            and is_ema_period_close
+            and ema_short_confirmed
         ):
+            if self._before_first_hour_close(bar.name):
+                updates["clear_pending_short_ema_wait"] = True
+                updates["set_pending_first_hour_short"] = {
+                    "trigger": "ema_cross",
+                    "deferred": self._deferred_ema_cross_payload(bar),
+                }
+                return None, updates
             if adx_ok_short:
                 updates["clear_pending_short_ema_wait"] = True
-                entry_px = float(close_h) if confirmed_hour else float(bar["close"])
-                return self._finalize_volume(
-                    self._signal(bar, SignalType.SELL, "ema_cross", entry_price=entry_px),
+                return self._return_gated_entry(
+                    bar,
+                    self._ema_cross_signal(bar, SignalType.SELL),
                     updates,
                     volume_window,
+                    is_long=False,
+                    trigger="ema_cross",
+                    deferred=self._deferred_ema_cross_payload(bar),
                 )
             updates["clear_pending_short_ema_wait"] = True
+            updates["set_deferred_ema_cross_short"] = self._deferred_ema_cross_payload(bar)
             updates["set_adx_wait_short"] = {"bars": self.adx_wait_bars_short, "trigger": "ema_cross"}
             return None, updates
 

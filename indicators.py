@@ -67,8 +67,11 @@ def resample_ohlcv(
     Indian cash session.
 
     For **hour-based** timeframes (``1H``, ``2h``, …), pass ``hourly_end_minute``
-    (e.g. ``45``) to label buckets at …:45 with ``closed='right'`` / ``label='right'``
-    so each hourly candle completes at 09:45, 10:45, etc.
+    (e.g. ``15`` for NSE IST). Buckets are built with ``closed='left'`` /
+    ``label='right'`` so each candle spans ``[:15, next :15)`` and is *labeled at its
+    close* (10:15, 11:15, …). This matches the TradingView NSE 1H convention: the
+    first hour is 09:15–10:14 (its close is the 10:14 one-minute close) and there is
+    no spurious single-minute 09:15 bar.
     """
     rule = timeframe_to_rule(timeframe)
     if hourly_end_minute is not None and timeframe_is_hour_based(timeframe):
@@ -78,7 +81,7 @@ def resample_ohlcv(
                 rule,
                 origin="start_day",
                 offset=off,
-                closed="right",
+                closed="left",
                 label="right",
             )
             .agg(OHLCV_AGG)
@@ -310,7 +313,7 @@ def enrich_with_ema_timeframe(
     Column names keep the existing `*_1h` convention for compatibility with the
     strategy engine, even when the configured EMA timeframe is not 1H.
 
-    When hourly buckets are **right-labeled** at a fixed minute (e.g. :45 via
+    When hourly buckets are **right-labeled** at a fixed minute (e.g. :15 IST via
     ``resample(..., closed='right', label='right')``), set ``shift_cross_for_lookahead``
     to False so EMA/close crosses are evaluated on the completed hour without an
     extra period shift.
@@ -325,7 +328,10 @@ def enrich_with_ema_timeframe(
     out["high_1h"] = ema_full["high"].reindex(out.index, method="ffill")
     out["low_1h"] = ema_full["low"].reindex(out.index, method="ffill")
 
-    out["is_new_1h_candle"] = (ema_label != ema_label.shift(1)).fillna(True)
+    out["ema_period_end"] = ema_label
+    is_period_close = out.index == ema_label
+    out["is_ema_period_close"] = is_period_close
+    out["is_new_1h_candle"] = (ema_label != ema_label.shift(1)).fillna(False) & is_period_close
     out["ema_bull"] = out["close_1h"] > out["ema_1h"]
     out["ema_bear"] = out["close_1h"] < out["ema_1h"]
 
@@ -335,12 +341,51 @@ def enrich_with_ema_timeframe(
     out["close_1h_cross"] = cross_avail["close"].reindex(out.index, method="ffill")
     out["ema_1h_cross"] = cross_avail["ema"].reindex(out.index, method="ffill")
 
-    prev_close = out["close_1h_cross"].shift(1)
-    prev_ema = out["ema_1h_cross"].shift(1)
-    out["ema_bull_cross"] = (out["close_1h_cross"] > out["ema_1h_cross"]) & (
-        prev_close <= prev_ema
-    )
-    out["ema_bear_cross"] = (out["close_1h_cross"] < out["ema_1h_cross"]) & (
-        prev_close >= prev_ema
-    )
+    if shift_cross_for_lookahead:
+        prev_close = out["close_1h_cross"].shift(1)
+        prev_ema = out["ema_1h_cross"].shift(1)
+        out["ema_bull_cross"] = (out["close_1h_cross"] > out["ema_1h_cross"]) & (
+            prev_close <= prev_ema
+        )
+        out["ema_bear_cross"] = (out["close_1h_cross"] < out["ema_1h_cross"]) & (
+            prev_close >= prev_ema
+        )
+    else:
+        prev_h_close = ema_full["close"].shift(1)
+        prev_h_ema = ema_full["ema"].shift(1)
+        bull_on_hour = (ema_full["close"] > ema_full["ema"]) & (prev_h_close <= prev_h_ema)
+        bear_on_hour = (ema_full["close"] < ema_full["ema"]) & (prev_h_close >= prev_h_ema)
+        bull_map = bull_on_hour.astype(bool)
+        bear_map = bear_on_hour.astype(bool)
+        hour_cross_bull = ema_label.map(bull_map).fillna(False).astype(bool)
+        hour_cross_bear = ema_label.map(bear_map).fillna(False).astype(bool)
+        out["ema_bull_cross"] = is_period_close & hour_cross_bull
+        out["ema_bear_cross"] = is_period_close & hour_cross_bear
+
+    return out
+
+
+def attach_ema_entry_1m_close(
+    prepared: pd.DataFrame,
+    df_1m: pd.DataFrame,
+    ema_timeframe: str,
+) -> pd.DataFrame:
+    """
+    Exact one-minute close of each hourly candle, used as the entry price.
+
+    ``close_1m_hour_boundary`` is the close of the hour that *ends* at the bar's
+    ``ema_period_end`` label, i.e. the :14 one-minute close (e.g. period_end 13:15
+    → the 13:14 close). With ``closed='left'`` hourly buckets this equals the
+    candle's ``close_1h``; both refer to the same completed hour, so entries are
+    always priced at the close of the candle that confirmed them (never the next
+    hour).
+    """
+    out = prepared.copy()
+    out["close_1m_hour_boundary"] = np.nan
+    mask = out["is_ema_period_close"].fillna(False)
+    if not mask.any():
+        return out
+    period_end = pd.to_datetime(out.loc[mask, "ema_period_end"])
+    lookup_boundary = period_end - pd.Timedelta(minutes=1)
+    out.loc[mask, "close_1m_hour_boundary"] = df_1m["close"].reindex(lookup_boundary).to_numpy()
     return out

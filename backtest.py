@@ -11,6 +11,7 @@ import pandas as pd
 import yaml
 
 from indicators import (
+    attach_ema_entry_1m_close,
     attach_long_short_indicators,
     enrich_with_ema_timeframe,
     resample_ohlcv,
@@ -32,7 +33,7 @@ class BacktestConfig:
     primary_timeframe: str
     ema_timeframe: str
     ema_length: int
-    # If set with hour-based ``ema_timeframe``, hourly OHLC is right-labeled at this minute (e.g. 45 -> …:45).
+    # If set with hour-based ``ema_timeframe``, hourly OHLC is right-labeled at this minute (e.g. 15 -> …:15 IST).
     hourly_bar_end_minute: Optional[int]
     sl_pct_long: float
     tp_pct_long: float
@@ -140,7 +141,8 @@ def build_backtest_config(
     elif timeframes_cfg.get("hourly_bar_end_minute") is not None:
         hourly_bar_end = int(timeframes_cfg["hourly_bar_end_minute"])
     elif timeframe_is_hour_based(ema_tf_resolved):
-        hourly_bar_end = 45
+        # NSE cash session opens 09:15 IST; hourly bars close at …:15 (TradingView 1H).
+        hourly_bar_end = 15
     else:
         hourly_bar_end = None
 
@@ -229,6 +231,7 @@ def prepare_backtest_data(
         ema_timeframe=bt_config.ema_timeframe,
         shift_cross_for_lookahead=not hour_right_edge,
     )
+    prepared = attach_ema_entry_1m_close(prepared, df_1m, bt_config.ema_timeframe)
     prepared = attach_long_short_indicators(
         prepared,
         sides["long_supertrend_entry"],
@@ -271,6 +274,7 @@ class BacktestEngine:
             adx_threshold_short=config.adx_threshold_short,
             volume_check=config.volume_check,
             volume_candle_lookahead=config.volume_candle_lookahead,
+            ema_timeframe=config.ema_timeframe,
         )
         self.state_manager = StateManager(
             point_value=config.point_value,
@@ -344,12 +348,36 @@ class BacktestEngine:
                     traded_in_bear_trend=state.traded_in_bear_trend if self.config.enable_short_entries else True,
                     pending_long_ema_wait=state.pending_long_ema_wait if self.config.enable_long_entries else False,
                     pending_short_ema_wait=state.pending_short_ema_wait if self.config.enable_short_entries else False,
+                    pending_first_hour_long=state.pending_first_hour_long
+                    if self.config.enable_long_entries
+                    else False,
+                    pending_first_hour_short=state.pending_first_hour_short
+                    if self.config.enable_short_entries
+                    else False,
+                    pending_first_hour_trigger_long=state.pending_first_hour_trigger_long
+                    if self.config.enable_long_entries
+                    else "",
+                    pending_first_hour_trigger_short=state.pending_first_hour_trigger_short
+                    if self.config.enable_short_entries
+                    else "",
+                    pending_first_hour_deferred_long=state.pending_first_hour_deferred_long
+                    if self.config.enable_long_entries
+                    else None,
+                    pending_first_hour_deferred_short=state.pending_first_hour_deferred_short
+                    if self.config.enable_short_entries
+                    else None,
                     pending_adx_long=state.pending_adx_long if self.config.enable_long_entries else False,
                     pending_adx_short=state.pending_adx_short if self.config.enable_short_entries else False,
                     adx_wait_bars_left_long=state.adx_wait_bars_left_long if self.config.enable_long_entries else 0,
                     adx_wait_bars_left_short=state.adx_wait_bars_left_short if self.config.enable_short_entries else 0,
                     adx_wait_trigger_long=state.adx_wait_trigger_long if self.config.enable_long_entries else "",
                     adx_wait_trigger_short=state.adx_wait_trigger_short if self.config.enable_short_entries else "",
+                    deferred_ema_cross_long=state.deferred_ema_cross_long
+                    if self.config.enable_long_entries
+                    else None,
+                    deferred_ema_cross_short=state.deferred_ema_cross_short
+                    if self.config.enable_short_entries
+                    else None,
                     volume_window=volume_window,
                 )
                 self._apply_updates(updates)
@@ -436,6 +464,20 @@ class BacktestEngine:
             sm.set_pending_short_ema_wait()
         if updates.get("clear_pending_short_ema_wait"):
             sm.clear_pending_short_ema_wait()
+        if updates.get("set_pending_first_hour_long"):
+            data = updates["set_pending_first_hour_long"]
+            sm.set_pending_first_hour_long(data["trigger"], data.get("deferred"))
+        if updates.get("clear_pending_first_hour_long"):
+            sm.clear_pending_first_hour_long()
+        if updates.get("set_pending_first_hour_short"):
+            data = updates["set_pending_first_hour_short"]
+            sm.set_pending_first_hour_short(data["trigger"], data.get("deferred"))
+        if updates.get("clear_pending_first_hour_short"):
+            sm.clear_pending_first_hour_short()
+        if updates.get("set_deferred_ema_cross_long"):
+            sm.set_deferred_ema_cross_long(updates["set_deferred_ema_cross_long"])
+        if updates.get("set_deferred_ema_cross_short"):
+            sm.set_deferred_ema_cross_short(updates["set_deferred_ema_cross_short"])
         if updates.get("set_adx_wait_long"):
             data = updates["set_adx_wait_long"]
             sm.set_adx_wait_long(data["bars"], data["trigger"])
