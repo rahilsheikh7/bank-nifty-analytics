@@ -11,12 +11,12 @@ import pandas as pd
 
 from indicators import timeframe_to_rule
 from live.bar_cache import (
+    apply_bar_retention,
     count_trading_sessions,
     load_bars_csv,
     merge_bars,
     resolve_bars_path,
     save_bars_csv,
-    trim_to_sessions,
 )
 from live.kite_warmup import fetch_kite_1min
 
@@ -53,6 +53,7 @@ def assess_warmup(
     df: pd.DataFrame,
     *,
     target_sessions: int,
+    max_bars: int = 0,
     ema_length: int,
     ema_timeframe: str,
     primary_timeframe: str,
@@ -83,7 +84,8 @@ def assess_warmup(
     else:
         msg = (
             f"Warmup OK ({source}): {sessions} sessions, {bar_count} 1-min bars "
-            f"(retention cap {target_sessions} sessions)."
+            f"(retention: {target_sessions} sessions"
+            f"{f', max {max_bars} bars' if max_bars > 0 else ''})."
         )
 
     return WarmupStatus(
@@ -99,9 +101,27 @@ def assess_warmup(
     )
 
 
+def _bars_per_trading_session() -> int:
+    return 375
+
+
+def effective_warmup_sessions(
+    warmup_sessions: int,
+    *,
+    max_bars: int = 0,
+    bars_per_session: int = 375,
+) -> int:
+    """Limit Kite fetch to roughly what retention will keep."""
+    if max_bars <= 0:
+        return warmup_sessions
+    needed = max(5, (max_bars // bars_per_session) + 2)
+    return min(warmup_sessions, needed)
+
+
 def build_warm_1min(
     warmup_sessions: int = 80,
     *,
+    warmup_max_bars: int = 0,
     bars_csv: str | Path,
     ema_length: int = 200,
     ema_timeframe: str = "5m",
@@ -114,10 +134,22 @@ def build_warm_1min(
     path = resolve_bars_path(bars_csv)
     overlay = load_bars_csv(path)
     source = "neo_cache"
+    fetch_sessions = effective_warmup_sessions(
+        warmup_sessions,
+        max_bars=warmup_max_bars,
+        bars_per_session=_bars_per_trading_session(),
+    )
 
     if warmup_source.strip().lower() == "kite_daily":
-        logger.info("Fetching %d sessions of 1-min history from Kite...", warmup_sessions)
-        kite_df = fetch_kite_1min(warmup_sessions)
+        if fetch_sessions < warmup_sessions:
+            logger.info(
+                "Fetching %d sessions from Kite (capped by warmup_max_bars=%d)",
+                fetch_sessions,
+                warmup_max_bars,
+            )
+        else:
+            logger.info("Fetching %d sessions of 1-min history from Kite...", fetch_sessions)
+        kite_df = fetch_kite_1min(fetch_sessions)
         if kite_df is not None:
             cutoff = _session_open_today(session_start)
             merged = merge_bars(kite_df, overlay, prefer_overlay_from=cutoff)
@@ -134,12 +166,17 @@ def build_warm_1min(
     else:
         merged = overlay
 
-    merged = trim_to_sessions(merged, warmup_sessions)
+    merged = apply_bar_retention(
+        merged,
+        max_sessions=warmup_sessions,
+        max_bars=warmup_max_bars,
+    )
     save_bars_csv(merged, path)
 
     status = assess_warmup(
         merged,
         target_sessions=warmup_sessions,
+        max_bars=warmup_max_bars,
         ema_length=ema_length,
         ema_timeframe=ema_timeframe,
         primary_timeframe=primary_timeframe,

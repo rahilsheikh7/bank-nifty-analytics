@@ -65,6 +65,8 @@ class LiveConfig:
     square_off_on_exit: bool
     flatten_on_shutdown: bool
     warmup_sessions: int
+    warmup_max_bars: int
+    log_retention_days: int
     bars_csv: str
     warmup_source: str
     kite_fallback_on_error: bool
@@ -99,7 +101,9 @@ def build_live_config(config_root: Dict[str, Any]) -> LiveConfig:
         intrabar_exit=bool(live.get("intrabar_exit", True)),
         square_off_on_exit=bool(live.get("square_off_on_exit", True)),
         flatten_on_shutdown=bool(live.get("flatten_on_shutdown", True)),
-        warmup_sessions=int(live.get("warmup_sessions", 80)),
+        warmup_sessions=int(live.get("warmup_sessions", 35)),
+        warmup_max_bars=int(live.get("warmup_max_bars", 12000)),
+        log_retention_days=int(live.get("log_retention_days", 3)),
         bars_csv=str(live.get("bars_csv", "live/cache/banknifty_1min_neo.csv")),
         warmup_source=str(live.get("warmup_source", "kite_daily")),
         kite_fallback_on_error=bool(live.get("kite_fallback_on_error", True)),

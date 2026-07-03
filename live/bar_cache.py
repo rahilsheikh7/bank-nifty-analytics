@@ -111,6 +111,29 @@ def trim_to_sessions(df: pd.DataFrame, max_sessions: int) -> pd.DataFrame:
     return df[df.index.map(lambda ts: ts.date() in keep)]
 
 
+def trim_to_max_bars(df: pd.DataFrame, max_bars: int) -> pd.DataFrame:
+    """Keep only the most recent ``max_bars`` 1-minute rows."""
+    if df.empty or max_bars <= 0:
+        return df
+    df = _normalize_df(df)
+    if len(df) <= max_bars:
+        return df
+    return df.iloc[-max_bars:]
+
+
+def apply_bar_retention(
+    df: pd.DataFrame,
+    *,
+    max_sessions: int,
+    max_bars: int = 0,
+) -> pd.DataFrame:
+    """Apply session and bar-count caps (whichever is stricter)."""
+    out = trim_to_sessions(df, max_sessions)
+    if max_bars > 0:
+        out = trim_to_max_bars(out, max_bars)
+    return out
+
+
 def load_bars_csv(path: Path) -> pd.DataFrame:
     if not path.exists():
         logger.info("No bar cache at %s; starting empty (bars will accumulate from Neo ticks)", path)
@@ -139,22 +162,44 @@ def save_bars_csv(df: pd.DataFrame, path: Path) -> None:
 class BarCache:
     """Thread-safe rolling store of 1-min bars built from Neo index ticks."""
 
-    def __init__(self, path: str | Path, *, max_sessions: int = 80):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        max_sessions: int = 80,
+        max_bars: int = 0,
+    ):
         self.path = resolve_bars_path(path)
         self.max_sessions = max_sessions
+        self.max_bars = max_bars
         self._lock = threading.Lock()
-        self.df = trim_to_sessions(load_bars_csv(self.path), max_sessions)
+        self.df = apply_bar_retention(
+            load_bars_csv(self.path),
+            max_sessions=max_sessions,
+            max_bars=max_bars,
+        )
 
     def reload(self) -> pd.DataFrame:
         with self._lock:
-            self.df = trim_to_sessions(load_bars_csv(self.path), self.max_sessions)
+            self.df = apply_bar_retention(
+                load_bars_csv(self.path),
+                max_sessions=self.max_sessions,
+                max_bars=self.max_bars,
+            )
             return self.df.copy()
+
+    def _trim_locked(self) -> None:
+        self.df = apply_bar_retention(
+            self.df,
+            max_sessions=self.max_sessions,
+            max_bars=self.max_bars,
+        )
 
     def record_bar(self, bar: pd.Series, *, persist: bool = True) -> None:
         """Append or update one finalized 1-min bar."""
         with self._lock:
             self.df.loc[bar.name] = bar[_OHLCV_COLS]
-            self.df = trim_to_sessions(self.df, self.max_sessions)
+            self._trim_locked()
             if persist:
                 save_bars_csv(self.df, self.path)
 
@@ -165,13 +210,32 @@ class BarCache:
                 return
             merged = pd.concat([self.df, _normalize_df(df_1m)])
             merged = merged[~merged.index.duplicated(keep="last")].sort_index()
-            self.df = trim_to_sessions(merged, self.max_sessions)
+            self.df = merged
+            self._trim_locked()
             if persist:
                 save_bars_csv(self.df, self.path)
 
     def flush(self) -> None:
         with self._lock:
+            self._trim_locked()
             save_bars_csv(self.df, self.path)
+
+    def trim_and_persist(self) -> int:
+        """Re-apply retention caps and rewrite CSV (e.g. after market close)."""
+        with self._lock:
+            before = len(self.df)
+            self._trim_locked()
+            save_bars_csv(self.df, self.path)
+            removed = before - len(self.df)
+            if removed > 0:
+                logger.info(
+                    "Bar cache trimmed: %d -> %d bars (%d sessions cap, %s bar cap)",
+                    before,
+                    len(self.df),
+                    self.max_sessions,
+                    self.max_bars if self.max_bars > 0 else "none",
+                )
+            return removed
 
     @property
     def sessions(self) -> int:

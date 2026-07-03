@@ -23,6 +23,7 @@ def main() -> int:
 
     _, status = build_warm_1min(
         live_cfg.warmup_sessions,
+        warmup_max_bars=live_cfg.warmup_max_bars,
         bars_csv=live_cfg.bars_csv,
         ema_length=bt_config.ema_length,
         ema_timeframe=bt_config.ema_timeframe,

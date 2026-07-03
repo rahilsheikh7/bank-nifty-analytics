@@ -18,12 +18,13 @@ import logging
 import signal
 import threading
 import time
+from datetime import date
 from typing import Any, Optional
 
 import pandas as pd
 
 from live.bar_cache import BarCache
-from live.logging_setup import LOG_FILE, setup_logging
+from live.logging_setup import LOG_FILE, prune_trading_log, setup_logging
 from live.config import (
     build_backtest_config_for_live,
     build_live_config,
@@ -79,6 +80,8 @@ class LiveRunner:
         self._last_stale_log_at = 0.0
         self._last_rest_fallback_at = 0.0
         self._warmup_ready = True
+        self._last_eod_date: Optional[date] = None
+        self._saw_session_today = False
 
     def _log_bar_range(self, df_1m: pd.DataFrame, label: str) -> None:
         if df_1m.empty:
@@ -228,6 +231,26 @@ class LiveRunner:
         except Exception as exc:
             logger.error("Daily trade session refresh failed: %s", exc)
 
+    def _maybe_end_of_day_maintenance(self) -> None:
+        """After the session closes, trim bar cache and old log lines once per day."""
+        if self.live_cfg is None:
+            return
+        now = pd.Timestamp.now(tz=IST)
+        today = now.date()
+        if _in_session(now, self.live_cfg):
+            self._saw_session_today = True
+            return
+        if not self._saw_session_today or self._last_eod_date == today:
+            return
+
+        self._last_eod_date = today
+        logger.info("Market session ended — running end-of-day cache/log retention")
+        if self.bar_cache is not None:
+            self.bar_cache.trim_and_persist()
+        removed = prune_trading_log(LOG_FILE, retention_days=self.live_cfg.log_retention_days)
+        if removed:
+            logger.info("Pruned %d old lines from %s", removed, LOG_FILE)
+
     def _feed_age_seconds(self, now: Optional[pd.Timestamp] = None) -> float:
         now = now or pd.Timestamp.now(tz=IST)
         last = self._last_tick_time or self._started_at
@@ -358,6 +381,10 @@ class LiveRunner:
         logger.info("Shutting down...")
         self.running = False
         self._persist_bars()
+        if self.bar_cache is not None:
+            self.bar_cache.trim_and_persist()
+        if self.live_cfg is not None:
+            prune_trading_log(LOG_FILE, retention_days=self.live_cfg.log_retention_days)
         if self.trader:
             self.trader.flatten_on_shutdown()
         if self.broker:
@@ -396,6 +423,7 @@ class LiveRunner:
 
         df_1m, warmup_status = build_warm_1min(
             self.live_cfg.warmup_sessions,
+            warmup_max_bars=self.live_cfg.warmup_max_bars,
             bars_csv=self.live_cfg.bars_csv,
             ema_length=self.bt_config.ema_length,
             ema_timeframe=self.bt_config.ema_timeframe,
@@ -421,6 +449,7 @@ class LiveRunner:
         self.bar_cache = BarCache(
             self.live_cfg.bars_csv,
             max_sessions=self.live_cfg.warmup_sessions,
+            max_bars=self.live_cfg.warmup_max_bars,
         )
         self.bar_cache.df = df_1m.copy()
         logger.info("Bar cache: %s", self.bar_cache.path)
@@ -485,13 +514,16 @@ class LiveRunner:
             self._check_feed_health()
             if self._heartbeat_counter % 60 == 0:
                 self._maybe_refresh_daily_session()
+                self._maybe_end_of_day_maintenance()
                 self._log_heartbeat()
 
         self._persist_bars()
 
 
 def main() -> None:
-    setup_logging()
+    config_root = load_live_config()
+    live_cfg = build_live_config(config_root)
+    setup_logging(log_retention_days=live_cfg.log_retention_days)
     try:
         LiveRunner().run()
     except KeyboardInterrupt:
