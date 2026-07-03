@@ -1,0 +1,21 @@
+[Unit]
+Description=Bank Nifty Live Options Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/home/trader/bank-nifty-analytics
+ExecStart=/home/trader/bank-nifty-analytics/deploy/run_live.sh
+Restart=always
+RestartSec=30
+TimeoutStopSec=120
+Environment=PYTHONUNBUFFERED=1
+
+StandardOutput=append:/home/trader/bank-nifty-analytics/logs/bot.stdout.log
+StandardError=append:/home/trader/bank-nifty-analytics/logs/bot.stderr.log
+
+[Install]
+WantedBy=multi-user.target
