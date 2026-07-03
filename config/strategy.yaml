@@ -9,42 +9,42 @@ strategy:
   description: "Standalone Bank Nifty backtest using local 1-minute continuous CSV"
 
 long_supertrend_entry:
-  atr_length: 12
-  multiplier: 4
+  atr_length: 10
+  multiplier: 2
 
 long_supertrend_exit:
-  atr_length: 12
-  multiplier: 4
+  atr_length: 10
+  multiplier: 2
 
 short_supertrend_entry:
-  atr_length: 12
-  multiplier: 4
+  atr_length: 10
+  multiplier: 2
 
 short_supertrend_exit:
-  atr_length: 12
-  multiplier: 4
+  atr_length: 10
+  multiplier: 2
 
 long_supertrend:
-  atr_length: 12
-  multiplier: 4
+  atr_length: 10
+  multiplier: 2
 
 short_supertrend:
-  atr_length: 12
-  multiplier: 4
+  atr_length: 10
+  multiplier: 2
 
 supertrend:
-  atr_length: 12
-  multiplier: 4
+  atr_length: 10
+  multiplier: 2
 
 ema:
   length: 200
   # Dynamic EMA timeframe. Examples: "10m", "20m", "30m", "1H".
-  timeframe: "1H"
+  timeframe: "5m"
 
 timeframes:
   # Primary bar size for Supertrend, ADX, volume MA, SL/TP, and backtest steps.
   # May be placed here or under strategy: (root wins if both exist).
-  primary: "10m"
+  primary: "5m"
   # For hour-based ``ema.timeframe`` (e.g. 1H): IST hourly close at …:15 (09:15, 10:15, …).
   # Set to null to use legacy 15m-offset hourly bars without right-edge labels.
   hourly_bar_end_minute: 15
@@ -65,21 +65,21 @@ long_adx:
   use_adx: false
   di_length: 14
   adx_smoothing: 14
-  threshold: 24
+  threshold: 20
   consecutive_candles: 5
 
 short_adx:
   use_adx: false
   di_length: 14
   adx_smoothing: 14
-  threshold: 24
+  threshold: 20
   consecutive_candles: 5
 
 adx:
   use_adx: false
   di_length: 14
   adx_smoothing: 14
-  threshold: 24
+  threshold: 20
   consecutive_candles: 5
 
 volume_check: false
@@ -105,3 +105,32 @@ costs:
 bar_close:
   wait_for_confirmation: true
   lookahead_protection: true
+
+# =============================================================================
+# LIVE TRADING (Kotak Neo) - used only by the live/ bot, ignored by backtest.py
+# Signals are computed on the BANKNIFTY index; each long/short is executed as a
+# 2-leg synthetic future on options (long = Buy ATM CE + Sell ATM PE; short =
+# Sell ATM CE + Buy ATM PE).
+# =============================================================================
+live:
+  mode: live                  # paper | live  (live = real MKT orders on Kotak Neo)
+  underlying_symbol: BANKNIFTY
+  index_name: "Nifty Bank"     # exact Neo index identifier for the market feed
+  index_segment: nse_cm
+  option_segment: nse_fo
+  structure: synthetic         # synthetic (2-leg) | single
+  product: NRML
+  order_type: MKT
+  lots: 1
+  strike_step: 100
+  expiry_rule: monthly         # monthly | weekly
+  expiry_roll_days: 1          # roll to the next expiry this many days before expiry
+  intrabar_exit: true          # true = SL/TP on every tick (diverges from bar-close backtest)
+  square_off_on_exit: true
+  flatten_on_shutdown: true
+  warmup_sessions: 80          # max trading days of 1-min bars kept in the cache CSV
+  warmup_source: kite_daily     # kite_daily | neo_cache
+  kite_fallback_on_error: true  # use bars_csv if Kite fetch fails
+  bars_csv: live/cache/banknifty_1min_neo.csv
+  session_start: "09:15"
+  session_end: "15:30"

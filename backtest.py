@@ -16,8 +16,10 @@ from indicators import (
     enrich_with_ema_timeframe,
     resample_ohlcv,
     timeframe_is_hour_based,
+    timeframe_to_rule,
 )
 from strategy import ExitSignal, ExitType, SignalEngine, SignalType, StateManager, Trade
+from strategy_runtime import apply_state_updates, step_bar
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -224,12 +226,18 @@ def prepare_backtest_data(
         bt_config.hourly_bar_end_minute is not None
         and timeframe_is_hour_based(bt_config.ema_timeframe)
     )
+    # When the EMA timeframe equals the primary timeframe, each primary bar IS an
+    # EMA bar that closes at the same instant, so no lookahead shift is needed:
+    # crosses/EMA-side are evaluated on the current bar's own close (process-on-close).
+    ema_on_primary = timeframe_to_rule(bt_config.ema_timeframe) == timeframe_to_rule(
+        bt_config.primary_timeframe
+    )
     prepared = enrich_with_ema_timeframe(
         primary,
         ema_bars,
         ema_length=bt_config.ema_length,
         ema_timeframe=bt_config.ema_timeframe,
-        shift_cross_for_lookahead=not hour_right_edge,
+        shift_cross_for_lookahead=not hour_right_edge and not ema_on_primary,
     )
     prepared = attach_ema_entry_1m_close(prepared, df_1m, bt_config.ema_timeframe)
     prepared = attach_long_short_indicators(
@@ -275,6 +283,8 @@ class BacktestEngine:
             volume_check=config.volume_check,
             volume_candle_lookahead=config.volume_candle_lookahead,
             ema_timeframe=config.ema_timeframe,
+            ema_on_primary=timeframe_to_rule(config.ema_timeframe)
+            == timeframe_to_rule(config.primary_timeframe),
         )
         self.state_manager = StateManager(
             point_value=config.point_value,
@@ -306,98 +316,30 @@ class BacktestEngine:
             if timestamp > self.config.end_date:
                 break
 
-            if self.config.enable_long_entries and self.config.enable_short_entries:
-                st_bull_flip = bool(bar.get("st_bull_flip", False))
-                st_bear_flip = bool(bar.get("st_bear_flip", False))
-            elif self.config.enable_long_entries:
-                st_bull_flip = bool(bar.get("st_bull_flip_long", False))
-                st_bear_flip = bool(bar.get("st_bear_flip_long", False))
-            else:
-                st_bull_flip = bool(bar.get("st_bull_flip_short", False))
-                st_bear_flip = bool(bar.get("st_bear_flip_short", False))
-
-            self.state_manager.update_supertrend_state(
-                st_bull_flip=st_bull_flip,
-                st_bear_flip=st_bear_flip,
-                current_direction=int(bar.get("direction", 0)),
+            result = step_bar(
+                bar=bar,
+                bar_index=i,
+                df=df,
+                state_manager=self.state_manager,
+                signal_engine=self.signal_engine,
+                config=self.config,
             )
+            if result.exit_signal:
+                trade = self._process_exit(result.exit_signal, bar)
+                if trade:
+                    equity += (trade.pnl_value or 0) - self.config.commission_per_trade
+                    self.equity_history.append((timestamp, equity))
 
-            state = self.state_manager.state
-            if state.position_size != 0:
-                exit_signal = self.signal_engine.check_exit_conditions(
-                    bar=bar,
-                    position_size=state.position_size,
-                    entry_price=state.entry_price,
-                    stop_loss=state.stop_loss,
-                    take_profit=state.take_profit,
-                    entry_time=state.entry_time,
+            if result.entry_signal:
+                self._process_entry(result.entry_signal)
+                self.signal_log.append(
+                    {
+                        "timestamp": result.entry_signal.timestamp,
+                        "signal": result.entry_signal.signal_type.value,
+                        "price": result.entry_signal.price,
+                        "trigger": result.entry_signal.trigger,
+                    }
                 )
-                if exit_signal:
-                    trade = self._process_exit(exit_signal, bar)
-                    if trade:
-                        equity += (trade.pnl_value or 0) - self.config.commission_per_trade
-                        self.equity_history.append((timestamp, equity))
-
-            state = self.state_manager.state
-            if state.position_size == 0:
-                volume_window = df.iloc[i : min(i + self.signal_engine.volume_candle_lookahead, len(df))]
-                entry_signal, updates = self.signal_engine.evaluate_entry_conditions(
-                    bar=bar,
-                    position_size=0,
-                    traded_in_bull_trend=state.traded_in_bull_trend if self.config.enable_long_entries else True,
-                    traded_in_bear_trend=state.traded_in_bear_trend if self.config.enable_short_entries else True,
-                    pending_long_ema_wait=state.pending_long_ema_wait if self.config.enable_long_entries else False,
-                    pending_short_ema_wait=state.pending_short_ema_wait if self.config.enable_short_entries else False,
-                    pending_first_hour_long=state.pending_first_hour_long
-                    if self.config.enable_long_entries
-                    else False,
-                    pending_first_hour_short=state.pending_first_hour_short
-                    if self.config.enable_short_entries
-                    else False,
-                    pending_first_hour_trigger_long=state.pending_first_hour_trigger_long
-                    if self.config.enable_long_entries
-                    else "",
-                    pending_first_hour_trigger_short=state.pending_first_hour_trigger_short
-                    if self.config.enable_short_entries
-                    else "",
-                    pending_first_hour_deferred_long=state.pending_first_hour_deferred_long
-                    if self.config.enable_long_entries
-                    else None,
-                    pending_first_hour_deferred_short=state.pending_first_hour_deferred_short
-                    if self.config.enable_short_entries
-                    else None,
-                    pending_adx_long=state.pending_adx_long if self.config.enable_long_entries else False,
-                    pending_adx_short=state.pending_adx_short if self.config.enable_short_entries else False,
-                    adx_wait_bars_left_long=state.adx_wait_bars_left_long if self.config.enable_long_entries else 0,
-                    adx_wait_bars_left_short=state.adx_wait_bars_left_short if self.config.enable_short_entries else 0,
-                    adx_wait_trigger_long=state.adx_wait_trigger_long if self.config.enable_long_entries else "",
-                    adx_wait_trigger_short=state.adx_wait_trigger_short if self.config.enable_short_entries else "",
-                    deferred_ema_cross_long=state.deferred_ema_cross_long
-                    if self.config.enable_long_entries
-                    else None,
-                    deferred_ema_cross_short=state.deferred_ema_cross_short
-                    if self.config.enable_short_entries
-                    else None,
-                    volume_window=volume_window,
-                )
-                self._apply_updates(updates)
-
-                if entry_signal and (
-                    (entry_signal.signal_type == SignalType.BUY and not self.config.enable_long_entries)
-                    or (entry_signal.signal_type == SignalType.SELL and not self.config.enable_short_entries)
-                ):
-                    entry_signal = None
-
-                if entry_signal:
-                    self._process_entry(entry_signal)
-                    self.signal_log.append(
-                        {
-                            "timestamp": entry_signal.timestamp,
-                            "signal": entry_signal.signal_type.value,
-                            "price": entry_signal.price,
-                            "trigger": entry_signal.trigger,
-                        }
-                    )
 
             state = self.state_manager.state
             if not self.equity_history or self.equity_history[-1][0] != timestamp:
@@ -455,43 +397,7 @@ class BacktestEngine:
         return BacktestResult(self.config, merged_trades, equity_curve, signals_df, metrics)
 
     def _apply_updates(self, updates: Dict[str, Any]) -> None:
-        sm = self.state_manager
-        if updates.get("set_pending_long_ema_wait"):
-            sm.set_pending_long_ema_wait()
-        if updates.get("clear_pending_long_ema_wait"):
-            sm.clear_pending_long_ema_wait()
-        if updates.get("set_pending_short_ema_wait"):
-            sm.set_pending_short_ema_wait()
-        if updates.get("clear_pending_short_ema_wait"):
-            sm.clear_pending_short_ema_wait()
-        if updates.get("set_pending_first_hour_long"):
-            data = updates["set_pending_first_hour_long"]
-            sm.set_pending_first_hour_long(data["trigger"], data.get("deferred"))
-        if updates.get("clear_pending_first_hour_long"):
-            sm.clear_pending_first_hour_long()
-        if updates.get("set_pending_first_hour_short"):
-            data = updates["set_pending_first_hour_short"]
-            sm.set_pending_first_hour_short(data["trigger"], data.get("deferred"))
-        if updates.get("clear_pending_first_hour_short"):
-            sm.clear_pending_first_hour_short()
-        if updates.get("set_deferred_ema_cross_long"):
-            sm.set_deferred_ema_cross_long(updates["set_deferred_ema_cross_long"])
-        if updates.get("set_deferred_ema_cross_short"):
-            sm.set_deferred_ema_cross_short(updates["set_deferred_ema_cross_short"])
-        if updates.get("set_adx_wait_long"):
-            data = updates["set_adx_wait_long"]
-            sm.set_adx_wait_long(data["bars"], data["trigger"])
-        if updates.get("set_adx_wait_short"):
-            data = updates["set_adx_wait_short"]
-            sm.set_adx_wait_short(data["bars"], data["trigger"])
-        if updates.get("clear_adx_wait_long"):
-            sm.clear_adx_wait_long()
-        if updates.get("clear_adx_wait_short"):
-            sm.clear_adx_wait_short()
-        if updates.get("decrement_adx_wait_long"):
-            sm.decrement_adx_wait_long()
-        if updates.get("decrement_adx_wait_short"):
-            sm.decrement_adx_wait_short()
+        apply_state_updates(self.state_manager, updates)
 
     def _process_entry(self, signal) -> None:
         if signal.signal_type == SignalType.BUY:
@@ -618,6 +524,203 @@ def _drawdown(equity_curve: pd.Series) -> Tuple[float, float]:
     drawdown = running_max - equity_curve
     drawdown_pct = (drawdown / running_max) * 100
     return float(drawdown.max()), float(drawdown_pct.max())
+
+
+def _profit_factor(trades: List[Trade]) -> float:
+    gross_profit = sum(t.pnl_value or 0 for t in trades if (t.pnl_value or 0) > 0)
+    gross_loss = abs(sum(t.pnl_value or 0 for t in trades if (t.pnl_value or 0) < 0))
+    if gross_loss > 0:
+        return gross_profit / gross_loss
+    return float("inf") if gross_profit > 0 else 0.0
+
+
+def _sharpe_ratio(equity_curve: pd.Series) -> float:
+    if equity_curve.empty or len(equity_curve) < 2:
+        return 0.0
+    daily = equity_curve.resample("D").last().dropna()
+    if len(daily) < 2:
+        return 0.0
+    returns = daily.pct_change().dropna()
+    if returns.empty or returns.std() == 0:
+        return 0.0
+    return float(returns.mean() / returns.std() * np.sqrt(252))
+
+
+def _direction_max_drawdown_pct(
+    trades: List[Trade],
+    direction: str,
+    initial_capital: float,
+) -> float:
+    subset = sorted(
+        [t for t in trades if t.direction == direction and t.exit_time is not None],
+        key=lambda t: t.exit_time,
+    )
+    if not subset:
+        return 0.0
+    equity = float(initial_capital)
+    curve = [equity]
+    for trade in subset:
+        equity += trade.pnl_value or 0
+        curve.append(equity)
+    _, pct = _drawdown(pd.Series(curve))
+    return pct
+
+
+def _format_period(start: pd.Timestamp, end: pd.Timestamp) -> str:
+    return f"{pd.Timestamp(start).strftime('%Y-%m-%d')} to {pd.Timestamp(end).strftime('%Y-%m-%d')}"
+
+
+def _fmt_money(value: float) -> str:
+    return f"${value:,.2f}"
+
+
+def _fmt_pct(value: float, decimals: int = 1) -> str:
+    return f"{value:.{decimals}f}%"
+
+
+def _extend_report_metrics(result: BacktestResult) -> Dict[str, Any]:
+    metrics = dict(result.metrics)
+    trades = result.trades
+    winners = [t for t in trades if (t.pnl_value or 0) > 0]
+    losers = [t for t in trades if (t.pnl_value or 0) < 0]
+    longs = [t for t in trades if t.direction == "long"]
+    shorts = [t for t in trades if t.direction == "short"]
+    long_winners = [t for t in longs if (t.pnl_value or 0) > 0]
+    short_winners = [t for t in shorts if (t.pnl_value or 0) > 0]
+
+    metrics["avg_win"] = (sum(t.pnl_value or 0 for t in winners) / len(winners)) if winners else 0.0
+    metrics["avg_loss"] = (sum(t.pnl_value or 0 for t in losers) / len(losers)) if losers else 0.0
+    metrics["largest_win"] = max((t.pnl_value or 0 for t in winners), default=0.0)
+    metrics["largest_loss"] = min((t.pnl_value or 0 for t in losers), default=0.0)
+    metrics["expectancy"] = metrics.get("avg_trade", 0.0)
+    metrics["sharpe_ratio"] = _sharpe_ratio(result.equity_curve)
+    metrics["long_wins"] = len(long_winners)
+    metrics["short_wins"] = len(short_winners)
+    metrics["long_profit_factor"] = _profit_factor(longs)
+    metrics["short_profit_factor"] = _profit_factor(shorts)
+    metrics["long_max_drawdown_pct"] = _direction_max_drawdown_pct(
+        trades, "long", result.config.initial_capital
+    )
+    metrics["short_max_drawdown_pct"] = _direction_max_drawdown_pct(
+        trades, "short", result.config.initial_capital
+    )
+    return metrics
+
+
+def _write_report_section(handle, title: str, rows: List[Tuple[str, str]]) -> None:
+    handle.write(f"{title}\n")
+    handle.write("-" * 30 + "\n")
+    for metric, value in rows:
+        handle.write(f"{metric},{value}\n")
+    handle.write("\n")
+
+
+def _build_report_sections(
+    result: BacktestResult,
+    strategy_cfg: Dict[str, Any],
+) -> List[Tuple[str, List[Tuple[str, str]]]]:
+    cfg = result.config
+    metrics = _extend_report_metrics(result)
+    sides = resolve_side_configs(strategy_cfg)
+    contract_cfg = merge_dict_sections(strategy_cfg, "contract")
+    contract_name = str(contract_cfg.get("name", "BANKNIFTY continuous"))
+    ema_tf = cfg.ema_timeframe
+
+    long_st_entry = sides["long_supertrend_entry"]
+    long_st_exit = sides["long_supertrend_exit"]
+    short_st_entry = sides["short_supertrend_entry"]
+    short_st_exit = sides["short_supertrend_exit"]
+
+    pf = metrics.get("profit_factor", 0.0)
+    long_pf = metrics.get("long_profit_factor", 0.0)
+    short_pf = metrics.get("short_profit_factor", 0.0)
+
+    return [
+        (
+            "PERFORMANCE SUMMARY",
+            [
+                ("Period", _format_period(cfg.start_date, cfg.end_date)),
+                ("Contract", contract_name),
+                ("Contracts per Trade", str(cfg.contracts)),
+                ("Initial Capital", _fmt_money(cfg.initial_capital)),
+                ("Final Equity", _fmt_money(metrics.get("final_equity", cfg.initial_capital))),
+                ("Net Profit/Loss", _fmt_money(metrics.get("net_profit", 0.0))),
+                ("Total P&L Points", f"{metrics.get('total_points', 0.0):.2f}"),
+                ("Total Profit Points", f"{metrics.get('total_profit_points', 0.0):.2f}"),
+                ("Total Loss Points", f"{metrics.get('total_loss_points', 0.0):.2f}"),
+                ("Total Return", _fmt_pct(metrics.get("total_return_pct", 0.0), decimals=2)),
+                ("Max Drawdown", _fmt_pct(metrics.get("max_drawdown_pct", 0.0), decimals=2)),
+                ("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0.0):.2f}"),
+            ],
+        ),
+        (
+            "TRADE STATISTICS",
+            [
+                ("Total Trades", str(metrics.get("total_trades", 0))),
+                ("Winning Trades", str(metrics.get("winning_trades", 0))),
+                ("Losing Trades", str(metrics.get("losing_trades", 0))),
+                ("Win Rate", _fmt_pct(metrics.get("win_rate", 0.0))),
+                ("Profit Factor", f"{pf:.2f}" if np.isfinite(pf) else "inf"),
+                ("Expectancy per Trade", _fmt_money(metrics.get("expectancy", 0.0))),
+                ("Average Win", _fmt_money(metrics.get("avg_win", 0.0))),
+                ("Average Loss", _fmt_money(metrics.get("avg_loss", 0.0))),
+                ("Largest Win", _fmt_money(metrics.get("largest_win", 0.0))),
+                ("Largest Loss", _fmt_money(metrics.get("largest_loss", 0.0))),
+            ],
+        ),
+        (
+            "LONG vs SHORT BREAKDOWN",
+            [
+                ("Long Trades", str(metrics.get("long_trades", 0))),
+                ("Long Wins", str(metrics.get("long_wins", 0))),
+                ("Long Win Rate", _fmt_pct(metrics.get("long_win_rate", 0.0))),
+                ("Long P&L (value)", _fmt_money(metrics.get("long_pnl_value", 0.0))),
+                ("Long P&L (points)", f"{metrics.get('long_pnl_points', 0.0):.2f}"),
+                (
+                    "Long Profit Factor",
+                    f"{long_pf:.2f}" if np.isfinite(long_pf) else "inf",
+                ),
+                ("Long Max Drawdown (%)", _fmt_pct(metrics.get("long_max_drawdown_pct", 0.0), decimals=2)),
+                ("Short Trades", str(metrics.get("short_trades", 0))),
+                ("Short Wins", str(metrics.get("short_wins", 0))),
+                ("Short Win Rate", _fmt_pct(metrics.get("short_win_rate", 0.0))),
+                ("Short P&L (value)", _fmt_money(metrics.get("short_pnl_value", 0.0))),
+                ("Short P&L (points)", f"{metrics.get('short_pnl_points', 0.0):.2f}"),
+                (
+                    "Short Profit Factor",
+                    f"{short_pf:.2f}" if np.isfinite(short_pf) else "inf",
+                ),
+                ("Short Max Drawdown (%)", _fmt_pct(metrics.get("short_max_drawdown_pct", 0.0), decimals=2)),
+            ],
+        ),
+        (
+            "EXIT TYPE BREAKDOWN",
+            [
+                ("Take Profit Exits", str(metrics.get("tp_exits", 0))),
+                ("Stop Loss Exits", str(metrics.get("sl_exits", 0))),
+                ("Supertrend Flip Exits", str(metrics.get("st_flip_exits", 0))),
+            ],
+        ),
+        (
+            "STRATEGY SETTINGS",
+            [
+                ("Primary Timeframe", cfg.primary_timeframe),
+                ("Supertrend ATR Long Entry", str(long_st_entry.get("atr_length", ""))),
+                ("Supertrend Mult Long Entry", str(float(long_st_entry.get("multiplier", 0)))),
+                ("Supertrend ATR Long Exit", str(long_st_exit.get("atr_length", ""))),
+                ("Supertrend Mult Long Exit", str(float(long_st_exit.get("multiplier", 0)))),
+                ("Supertrend ATR Short Entry", str(short_st_entry.get("atr_length", ""))),
+                ("Supertrend Mult Short Entry", str(float(short_st_entry.get("multiplier", 0)))),
+                ("Supertrend ATR Short Exit", str(short_st_exit.get("atr_length", ""))),
+                ("Supertrend Mult Short Exit", str(float(short_st_exit.get("multiplier", 0)))),
+                (f"EMA Length ({ema_tf})", str(cfg.ema_length)),
+                ("Stop Loss % Long", _fmt_pct(cfg.sl_pct_long, decimals=2)),
+                ("Stop Loss % Short", _fmt_pct(cfg.sl_pct_short, decimals=2)),
+                ("Take Profit % Long", _fmt_pct(cfg.tp_pct_long, decimals=2)),
+                ("Take Profit % Short", _fmt_pct(cfg.tp_pct_short, decimals=2)),
+            ],
+        ),
+    ]
 
 
 # (series label, bullish flip column, bearish flip column); see indicators.attach_long_short_indicators
@@ -771,51 +874,18 @@ def write_outputs(
     result: BacktestResult,
     output_dir: Path = DEFAULT_RESULTS_DIR,
     stamp: Optional[str] = None,
+    strategy_cfg: Optional[Dict[str, Any]] = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = stamp or datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = output_dir / f"banknifty_backtest_{stamp}.csv"
 
-    metrics = result.metrics
-    report_rows = [
-        ("Period", f"{result.config.start_date} to {result.config.end_date}"),
-        ("Primary Timeframe", result.config.primary_timeframe),
-        ("EMA Timeframe", result.config.ema_timeframe),
-        ("EMA Length", result.config.ema_length),
-        (
-            "Hourly bar end (minute)",
-            result.config.hourly_bar_end_minute
-            if result.config.hourly_bar_end_minute is not None
-            else "legacy (15m offset)",
-        ),
-        ("Contracts", result.config.contracts),
-        ("Initial Capital", result.config.initial_capital),
-        ("Final Equity", metrics.get("final_equity", 0)),
-        ("Net Profit/Loss", metrics.get("net_profit", 0)),
-        ("Total P&L Points", metrics.get("total_points", 0)),
-        ("Total Return %", metrics.get("total_return_pct", 0)),
-        ("Max Drawdown %", metrics.get("max_drawdown_pct", 0)),
-        ("Total Trades", metrics.get("total_trades", 0)),
-        ("Winning Trades", metrics.get("winning_trades", 0)),
-        ("Losing Trades", metrics.get("losing_trades", 0)),
-        ("Win Rate %", metrics.get("win_rate", 0)),
-        ("Profit Factor", metrics.get("profit_factor", 0)),
-        ("Long Trades", metrics.get("long_trades", 0)),
-        ("Long Win Rate %", metrics.get("long_win_rate", 0)),
-        ("Long P&L Points", metrics.get("long_pnl_points", 0)),
-        ("Short Trades", metrics.get("short_trades", 0)),
-        ("Short Win Rate %", metrics.get("short_win_rate", 0)),
-        ("Short P&L Points", metrics.get("short_pnl_points", 0)),
-        ("Take Profit Exits", metrics.get("tp_exits", 0)),
-        ("Stop Loss Exits", metrics.get("sl_exits", 0)),
-        ("Supertrend Flip Exits", metrics.get("st_flip_exits", 0)),
-    ]
-    report_df = pd.DataFrame(report_rows, columns=["metric", "value"])
+    cfg_for_report = strategy_cfg or {}
     trades_df = trades_to_dataframe(result.trades)
-    with output_path.open("w", newline="", encoding="utf-8") as f:
-        report_df.to_csv(f, index=False)
-        f.write("\n")
-        trades_df.to_csv(f, index=False, float_format="%.2f")
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        for title, rows in _build_report_sections(result, cfg_for_report):
+            _write_report_section(handle, title, rows)
+        trades_df.to_csv(handle, index=False, float_format="%.2f")
     return output_path
 
 
@@ -924,7 +994,7 @@ def run_from_args(args: argparse.Namespace) -> BacktestResult:
     )
     engine = BacktestEngine(bt_config)
     result = engine.run(prepared)
-    output_path = write_outputs(result, out_dir, stamp=stamp)
+    output_path = write_outputs(result, out_dir, stamp=stamp, strategy_cfg=strategy_cfg)
     append_backtest_summary_to_session_log(session_log_path, result, output_path)
     print_summary(result, output_path, session_log_path=session_log_path)
     return result

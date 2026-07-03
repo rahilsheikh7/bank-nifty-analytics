@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 # NSE cash session opens 09:15 IST; first 1H candle completes at 10:15.
+SESSION_OPEN = time(9, 15)
 SESSION_FIRST_HOUR_CLOSE = time(10, 15)
 
 
@@ -316,7 +317,19 @@ class SignalEngine:
         volume_check: bool = False,
         volume_candle_lookahead: int = 1,
         ema_timeframe: str = "1H",
+        ema_on_primary: bool = False,
     ):
+        self.ema_timeframe = str(ema_timeframe)
+        # True when the EMA timeframe equals the primary timeframe: every primary bar
+        # is itself an EMA candle, so entries fire at the signal bar's own close/label
+        # (like st_flip) with no hourly "first-hour" gate and no lookahead shift.
+        self.ema_on_primary = bool(ema_on_primary)
+        # Width of one EMA candle, used to label hourly ema_cross entries at the candle
+        # START (open) time rather than its right-edge close label (e.g. 15:15 -> 14:15).
+        try:
+            self.ema_timeframe_delta = pd.Timedelta(self.ema_timeframe)
+        except (ValueError, TypeError):
+            self.ema_timeframe_delta = pd.Timedelta(hours=1)
         self.sl_pct_long = float(sl_pct_long)
         self.tp_pct_long = float(tp_pct_long)
         self.sl_pct_short = float(sl_pct_short)
@@ -352,9 +365,25 @@ class SignalEngine:
             return None
 
         is_long = position_size > 0
+        open_ = float(bar["open"])
         high = float(bar["high"])
         low = float(bar["low"])
         close = float(bar["close"])
+
+        # Overnight gap at the session open (09:15): if the market opens beyond our
+        # SL/TP we cannot fill at those levels intrabar, so exit at the actual open
+        # price and book the extra loss/profit (gaps are outside our control).
+        if self._is_session_open_bar(bar):
+            if is_long:
+                if open_ <= stop_loss:
+                    return ExitSignal(ExitType.STOP_LOSS, bar.name, open_, entry_price, open_ - entry_price)
+                if open_ >= take_profit:
+                    return ExitSignal(ExitType.TAKE_PROFIT, bar.name, open_, entry_price, open_ - entry_price)
+            else:
+                if open_ >= stop_loss:
+                    return ExitSignal(ExitType.STOP_LOSS, bar.name, open_, entry_price, entry_price - open_)
+                if open_ <= take_profit:
+                    return ExitSignal(ExitType.TAKE_PROFIT, bar.name, open_, entry_price, entry_price - open_)
 
         if is_long:
             if low <= stop_loss:
@@ -380,10 +409,23 @@ class SignalEngine:
     def _before_first_hour_close(timestamp: pd.Timestamp) -> bool:
         return pd.Timestamp(timestamp).time() < SESSION_FIRST_HOUR_CLOSE
 
+    def _should_first_hour_gate(self, timestamp: pd.Timestamp) -> bool:
+        # The "wait until the first 1H candle closes (10:15)" gate only applies when the
+        # EMA runs on a higher (hourly) timeframe. With an EMA on the primary timeframe
+        # every bar is a valid decision point, including the 09:15 open, so no gate.
+        if self.ema_on_primary:
+            return False
+        return self._before_first_hour_close(timestamp)
+
     @staticmethod
     def _is_first_hour_close_bar(bar: pd.Series) -> bool:
         ts = pd.Timestamp(bar.name)
         return (ts.hour, ts.minute) == (SESSION_FIRST_HOUR_CLOSE.hour, SESSION_FIRST_HOUR_CLOSE.minute)
+
+    @staticmethod
+    def _is_session_open_bar(bar: pd.Series) -> bool:
+        ts = pd.Timestamp(bar.name)
+        return (ts.hour, ts.minute) == (SESSION_OPEN.hour, SESSION_OPEN.minute)
 
     @staticmethod
     def _ema_side_ok_long(bar: pd.Series, confirmed_valid: bool, close_confirmed: Any, ema_confirmed: Any) -> bool:
@@ -415,7 +457,7 @@ class SignalEngine:
         trigger: str,
         deferred: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Signal], Dict[str, Any]]:
-        if signal is None or not self._before_first_hour_close(bar.name):
+        if signal is None or not self._should_first_hour_gate(bar.name):
             return signal, updates
         key = "set_pending_first_hour_long" if is_long else "set_pending_first_hour_short"
         updates[key] = {"trigger": trigger, "deferred": deferred}
@@ -464,7 +506,7 @@ class SignalEngine:
                                     SignalType.BUY,
                                     "ema_cross",
                                     entry_price=float(deferred["price"]),
-                                    timestamp=self._hour_boundary_entry_time(bar),
+                                    timestamp=self._ema_candle_open_time(bar),
                                     ema_1h=float(deferred["ema_1h"]),
                                     close_1h=float(deferred["close_1h"]),
                                 ),
@@ -502,7 +544,7 @@ class SignalEngine:
                                     SignalType.SELL,
                                     "ema_cross",
                                     entry_price=float(deferred["price"]),
-                                    timestamp=self._hour_boundary_entry_time(bar),
+                                    timestamp=self._ema_candle_open_time(bar),
                                     ema_1h=float(deferred["ema_1h"]),
                                     close_1h=float(deferred["close_1h"]),
                                 ),
@@ -528,19 +570,27 @@ class SignalEngine:
 
         return None, updates
 
-    @staticmethod
-    def _ema_cross_entry_fields(bar: pd.Series) -> Tuple[pd.Timestamp, float, float, float]:
-        """
-        EMA-cross entry at the hourly close that confirms the cross.
+    def _ema_candle_open_time(self, bar: pd.Series) -> pd.Timestamp:
+        """Start (open) timestamp of the EMA candle that confirms an ema_cross.
 
-        Entry timestamp = that candle's close (``ema_period_end``, e.g. 13:15) and
-        entry price = the close of the *same* candle (the :14 one-minute close,
-        e.g. 13:14). This is identical in form to the first-hour open entry, so
-        every entry is "exact close time + that candle's close" — the next hour is
-        never used.
+        ``ema_period_end`` is the candle's right-edge close label (e.g. 15:15 for
+        the 14:15-15:14 hourly candle); subtract one EMA timeframe to get the candle
+        start (14:15), matching the candle-start convention used by st_flip entries.
         """
         period_end = bar.get("ema_period_end", bar.name)
-        entry_time = pd.Timestamp(period_end) if pd.notna(period_end) else bar.name
+        ts = pd.Timestamp(period_end) if pd.notna(period_end) else pd.Timestamp(bar.name)
+        return ts - self.ema_timeframe_delta
+
+    def _ema_cross_entry_fields(self, bar: pd.Series) -> Tuple[pd.Timestamp, float, float, float]:
+        """
+        EMA-cross entry at the hourly candle that confirms the cross.
+
+        Entry timestamp = that candle's START/open time (e.g. 14:15 for the
+        14:15-15:14 candle) and entry price = the close of the *same* candle (the
+        :14 one-minute close, e.g. 15:14). This matches the candle-start labelling
+        that st_flip entries already use; the next hour is never used.
+        """
+        entry_time = self._ema_candle_open_time(bar)
         entry_px = bar.get("close_1m_hour_boundary", np.nan)
         if pd.isna(entry_px):
             entry_px = bar.get("close_1h", bar["close"])
@@ -588,12 +638,20 @@ class SignalEngine:
         deferred: Optional[Dict[str, Any]] = None,
     ) -> Signal:
         if deferred:
-            ts = deferred["timestamp"]
-            price = float(deferred["price"])
-            ema_1h = float(deferred["ema_1h"])
-            close_1h = float(deferred["close_1h"])
-        else:
-            ts, price, ema_1h, close_1h = self._ema_cross_entry_fields(bar)
+            return self._signal(
+                bar,
+                signal_type,
+                "ema_cross",
+                entry_price=float(deferred["price"]),
+                timestamp=deferred["timestamp"],
+                ema_1h=float(deferred["ema_1h"]),
+                close_1h=float(deferred["close_1h"]),
+            )
+        if self.ema_on_primary:
+            # EMA timeframe == primary: the cross is confirmed on this bar, so enter at
+            # this bar's own close and label (same convention as st_flip entries).
+            return self._signal(bar, signal_type, "ema_cross")
+        ts, price, ema_1h, close_1h = self._ema_cross_entry_fields(bar)
         return self._signal(
             bar,
             signal_type,
@@ -605,6 +663,13 @@ class SignalEngine:
         )
 
     def _deferred_ema_cross_payload(self, bar: pd.Series) -> Dict[str, Any]:
+        if self.ema_on_primary:
+            return {
+                "timestamp": bar.name,
+                "price": float(bar["close"]),
+                "ema_1h": float(bar.get("ema_1h", np.nan)),
+                "close_1h": float(bar.get("close_1h", np.nan)),
+            }
         ts, price, ema_1h, close_1h = self._ema_cross_entry_fields(bar)
         return {
             "timestamp": ts,
@@ -731,9 +796,9 @@ class SignalEngine:
 
         if st_bull_flip_long and not traded_in_bull_trend:
             if self._ema_side_ok_long(bar, confirmed_valid, close_confirmed, ema_confirmed):
-                if self._before_first_hour_close(bar.name):
-                    updates["set_pending_first_hour_long"] = {"trigger": "st_flip", "deferred": None}
-                    return None, updates
+                # EMA is already on the bullish side when Supertrend flips -> a clear
+                # direct entry at the close of the flip bar. This holds even during the
+                # opening hour (e.g. a 09:25 flip): no need to wait for the 10:15 close.
                 if adx_ok_long:
                     return self._finalize_volume(
                         self._signal(bar, SignalType.BUY, "st_flip"), updates, volume_window
@@ -745,9 +810,8 @@ class SignalEngine:
 
         if st_bear_flip_short and not traded_in_bear_trend:
             if self._ema_side_ok_short(bar, confirmed_valid, close_confirmed, ema_confirmed):
-                if self._before_first_hour_close(bar.name):
-                    updates["set_pending_first_hour_short"] = {"trigger": "st_flip", "deferred": None}
-                    return None, updates
+                # EMA already on the bearish side when Supertrend flips -> direct entry
+                # at the close of the flip bar, including during the opening hour.
                 if adx_ok_short:
                     return self._finalize_volume(
                         self._signal(bar, SignalType.SELL, "st_flip"), updates, volume_window
@@ -875,7 +939,7 @@ class SignalEngine:
             and is_ema_period_close
             and ema_long_confirmed
         ):
-            if self._before_first_hour_close(bar.name):
+            if self._should_first_hour_gate(bar.name):
                 updates["clear_pending_long_ema_wait"] = True
                 updates["set_pending_first_hour_long"] = {
                     "trigger": "ema_cross",
@@ -905,7 +969,7 @@ class SignalEngine:
             and is_ema_period_close
             and ema_short_confirmed
         ):
-            if self._before_first_hour_close(bar.name):
+            if self._should_first_hour_gate(bar.name):
                 updates["clear_pending_short_ema_wait"] = True
                 updates["set_pending_first_hour_short"] = {
                     "trigger": "ema_cross",

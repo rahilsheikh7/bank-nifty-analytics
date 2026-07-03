@@ -1,0 +1,5 @@
+# Live trading (Kotak Neo) dependencies — install on top of requirements.txt
+# The Neo SDK is installed straight from GitHub (per the official README).
+git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client
+pyotp>=2.9.0
+websocket-client>=1.7.0

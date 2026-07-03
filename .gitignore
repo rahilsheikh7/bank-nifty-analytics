@@ -1,8 +1,42 @@
+# Environment and local secrets
 .env
-*.parquet
-__pycache__/
+.env.*
+!.env.example
+token.json
+api.txt
+
+# Python environments and caches
 .venv/
 venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs and runtime output
+*.log
+trading.log
 results/
+live/state/
+
+# Market data/cache files generated at runtime
+*.parquet
+live/cache/
 nifty/
 nifty.zip
+
+# Local editor/agent state
+.cursor/
+.vscode/
+
+# OS noise
+.DS_Store
+Thumbs.db
+demo.html
+demo.js
+hsi_neo.txt
+neo.js
+NEOWebsocketinfo.pdf

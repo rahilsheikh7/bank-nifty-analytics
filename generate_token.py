@@ -36,7 +36,7 @@ data = kite.generate_session(request_token=request_token, api_secret=API_SECRET)
 access_token = data["access_token"]
 
 print("\nAccess Token:")
-print(access_token)
+print(data)
 print(
     "\nAdd this line to your .env file:\n"
     f'KITE_ACCESS_TOKEN="{access_token}"'
