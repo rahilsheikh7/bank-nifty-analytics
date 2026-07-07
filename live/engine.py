@@ -14,8 +14,8 @@ from indicators import timeframe_to_rule
 from live.bar_decision_log import log_primary_bar_decision, snapshot_state
 from live.config import LiveConfig
 from live.neo_client import BUY, Leg, LegOrder, NeoBroker, SELL
-from live.persistence import LivePosition, clear_state, load_state, save_state
-from live.safety import place_legs_safe, square_off_safe
+from live.persistence import LivePosition, load_state, save_state
+from live.safety import OrderFillWatcher, legs_filled, place_legs_safe, square_off_safe
 from strategy import ExitSignal, ExitType, Signal, SignalEngine, SignalType, StateManager, Trade
 from strategy_runtime import step_bar
 
@@ -32,12 +32,16 @@ class LiveTrader:
         bt_config: BacktestConfig,
         strategy_cfg: Dict[str, Any],
         df_1m: pd.DataFrame,
+        *,
+        order_fill_watcher: Optional[OrderFillWatcher] = None,
     ):
         self.broker = broker
         self.live_cfg = live_cfg
         self.bt_config = bt_config
         self.strategy_cfg = strategy_cfg
         self.df_1m = df_1m
+        self.order_fill_watcher = order_fill_watcher
+        self._last_index_price: Optional[float] = None
         self.prepared: Optional[pd.DataFrame] = None
 
         self.signal_engine = SignalEngine(
@@ -209,6 +213,7 @@ class LiveTrader:
         self._persist()
 
     def on_index_tick(self, price: float, ts: Optional[datetime] = None) -> None:
+        self._last_index_price = float(price)
         if not self.live_cfg.intrabar_exit:
             return
         state = self.state_manager.state
@@ -238,7 +243,14 @@ class LiveTrader:
 
         is_long = signal.signal_type == SignalType.BUY
         direction = "long" if is_long else "short"
-        index_price = float(signal.price)
+        signal_index_price = float(signal.price)
+        index_price = self._last_index_price if self._last_index_price is not None else signal_index_price
+        if self._last_index_price is not None and abs(index_price - signal_index_price) > 0.01:
+            logger.info(
+                "Entry index from live tick %.2f (signal close %.2f)",
+                index_price,
+                signal_index_price,
+            )
 
         if self.bt_config.slippage_points:
             if is_long:
@@ -270,15 +282,24 @@ class LiveTrader:
         orders = self._entry_orders(direction, legs)
 
         try:
-            refs = place_legs_safe(self.broker, orders, tag=f"entry_{direction}", check_margin=True)
+            refs = place_legs_safe(
+                self.broker,
+                orders,
+                tag=f"entry_{direction}",
+                check_margin=True,
+                order_watcher=self.order_fill_watcher,
+                fill_timeout_sec=self.live_cfg.order_fill_timeout_sec,
+            )
         except Exception as exc:
             logger.error("Entry failed: %s", exc)
             return
 
-        if len(refs) < 2 or any(r.status.lower() == "rejected" for r in refs if r.status):
-            logger.error("Entry leg rejected; attempting to flatten any filled leg")
+        if not legs_filled(refs) or any(
+            str(r.status or "").lower() == "rejected" for r in refs if r.status
+        ):
+            logger.error("Entry leg rejected or unfilled; attempting to flatten any filled leg")
             for order, ref in zip(orders, refs):
-                if ref.status not in {"rejected", "paper"} or ref.is_paper:
+                if ref.avg_price > 0 and not ref.is_paper:
                     from live.safety import flatten_orphan_leg
 
                     flatten_orphan_leg(self.broker, order.leg, order.side, order.quantity)
@@ -337,7 +358,13 @@ class LiveTrader:
         pos = self.live_position
         exit_orders = self._exit_orders(pos)
         try:
-            exit_refs = square_off_safe(self.broker, exit_orders, tag=f"exit_{exit_signal.exit_type.value}")
+            exit_refs = square_off_safe(
+                self.broker,
+                exit_orders,
+                tag=f"exit_{exit_signal.exit_type.value}",
+                order_watcher=self.order_fill_watcher,
+                fill_timeout_sec=self.live_cfg.order_fill_timeout_sec,
+            )
         except Exception as exc:
             logger.error("Square-off failed: %s", exc)
             return
@@ -359,7 +386,7 @@ class LiveTrader:
             self._log_trade(trade, pos, ce_exit, pe_exit, exit_signal.exit_type.value)
 
         self.live_position = None
-        clear_state()
+        self._persist()
         logger.info("EXIT %s @ index %.2f (%s)", pos.direction, exit_signal.exit_price, exit_signal.exit_type.value)
 
     def flatten_on_shutdown(self) -> None:

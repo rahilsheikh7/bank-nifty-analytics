@@ -43,6 +43,21 @@ def _fmt_num(value: Any, digits: int = 2) -> str:
         return str(value)
 
 
+def _cmp_relation(close_value: Any, ema_value: Any) -> str:
+    if pd.isna(close_value) or pd.isna(ema_value):
+        return "n/a"
+    try:
+        close_f = float(close_value)
+        ema_f = float(ema_value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if close_f > ema_f:
+        return "above"
+    if close_f < ema_f:
+        return "below"
+    return "equal"
+
+
 def _bar_flags(bar: pd.Series) -> Dict[str, Any]:
     close_1h = bar.get("close_1h_cross", bar.get("close_1h", np.nan))
     ema_1h = bar.get("ema_1h_cross", bar.get("ema_1h", np.nan))
@@ -63,9 +78,74 @@ def _bar_flags(bar: pd.Series) -> Dict[str, Any]:
         "ema_ok_short": ema_ok_short,
         "close_1h": _fmt_num(close_1h),
         "ema_1h": _fmt_num(ema_1h),
+        "close_1h_raw": close_1h,
+        "ema_1h_raw": ema_1h,
+        "ema_relation": _cmp_relation(close_1h, ema_1h),
         "ema_bull_cross": bool(bar.get("ema_bull_cross", False)),
         "ema_bear_cross": bool(bar.get("ema_bear_cross", False)),
     }
+
+
+def _st_summary(flags: Dict[str, Any]) -> str:
+    if flags["st_bull"] and not flags["st_bear"]:
+        state = "bull"
+    elif flags["st_bear"] and not flags["st_bull"]:
+        state = "bear"
+    elif flags["direction"] < 0:
+        state = "bull"
+    elif flags["direction"] > 0:
+        state = "bear"
+    else:
+        state = "neutral"
+
+    flips: list[str] = []
+    if flags["st_bull_flip"]:
+        flips.append("bull_flip")
+    if flags["st_bear_flip"]:
+        flips.append("bear_flip")
+    flip_text = ",".join(flips) if flips else "none"
+    return f"ST={state} flip={flip_text}"
+
+
+def _ema_summary(flags: Dict[str, Any]) -> str:
+    symbol = {"above": ">", "below": "<", "equal": "="}.get(flags["ema_relation"], "?")
+    return (
+        f"EMA200={flags['ema_1h']} cmp_close={flags['close_1h']} "
+        f"({flags['ema_relation']}, close {symbol} EMA)"
+    )
+
+
+def _pending_ema_summary(state_before: Dict[str, Any], updates: Dict[str, Any], flags: Dict[str, Any]) -> str:
+    pending_long = bool(state_before["pending_long_ema_wait"])
+    pending_short = bool(state_before["pending_short_ema_wait"])
+
+    if updates.get("set_pending_long_ema_wait"):
+        pending_long = True
+    if updates.get("clear_pending_long_ema_wait"):
+        pending_long = False
+    if updates.get("set_pending_short_ema_wait"):
+        pending_short = True
+    if updates.get("clear_pending_short_ema_wait"):
+        pending_short = False
+
+    detail = ""
+    if pending_long:
+        detail = f" waiting_long(close must be above EMA; now {flags['close_1h']} is {flags['ema_relation']} {flags['ema_1h']})"
+    elif pending_short:
+        detail = f" waiting_short(close must be below EMA; now {flags['close_1h']} is {flags['ema_relation']} {flags['ema_1h']})"
+    return f"pending_ema=L:{pending_long}/S:{pending_short}{detail}"
+
+
+def _entry_condition(side: str, trigger: str, flags: Dict[str, Any]) -> str:
+    if trigger == "st_flip":
+        if side == "LONG":
+            return f"ST bull flip + close above EMA200 ({flags['close_1h']} > {flags['ema_1h']})"
+        return f"ST bear flip + close below EMA200 ({flags['close_1h']} < {flags['ema_1h']})"
+    if trigger == "ema_cross":
+        if side == "LONG":
+            return f"pending long EMA wait confirmed ({flags['close_1h']} > {flags['ema_1h']})"
+        return f"pending short EMA wait confirmed ({flags['close_1h']} < {flags['ema_1h']})"
+    return trigger
 
 
 def _interpret_updates(updates: Dict[str, Any]) -> list[str]:
@@ -182,45 +262,56 @@ def log_primary_bar_decision(
     if result.entry_signal:
         sig = result.entry_signal
         side = "LONG" if sig.signal_type.name == "BUY" else "SHORT"
+        condition = _entry_condition(side, sig.trigger, flags)
         logger.info(
-            "Bar %s | SIGNAL %s %s @ %s trigger=%s | close=%s ADX=%s ST_dir=%s",
+            "Bar %s | SIGNAL %s @ %s condition=%s | %s | %s | ADX=%s adx_ok=%s | %s",
             primary_ts,
             side,
-            sig.trigger,
             _fmt_num(sig.price),
-            sig.trigger,
-            flags["close"],
+            condition,
+            _st_summary(flags),
+            _ema_summary(flags),
             flags["adx"],
-            flags["direction"],
+            flags["adx_ok_long"] if side == "LONG" else flags["adx_ok_short"],
+            _pending_ema_summary(state_before, result.updates, flags),
         )
         return
 
     if result.exit_signal:
+        notes = _interpret_updates(result.updates)
+        suffix = f" | {'; '.join(notes)}" if notes else ""
         logger.info(
-            "Bar %s | EXIT %s @ %s | close=%s ADX=%s",
+            "Bar %s | EXIT %s @ %s | close=%s | %s | %s | ADX=%s | %s%s",
             primary_ts,
             result.exit_signal.exit_type.value,
             _fmt_num(result.exit_signal.exit_price),
             flags["close"],
+            _st_summary(flags),
+            _ema_summary(flags),
             flags["adx"],
+            _pending_ema_summary(state_before, result.updates, flags),
+            suffix,
         )
         return
 
     # Default: log decision context (compact + reason)
     logger.info(
-        "Bar %s | close=%s ST_flip=%s/%s ST_bull=%s ADX=%s adx_ok_L=%s ema_ok_L=%s | pos=%s "
-        "adx_wait_L=%s(%s) traded_bull=%s | %s",
+        "Bar %s | close=%s | %s | %s | ADX=%s adx_ok=L:%s/S:%s | pos=%s "
+        "adx_wait=L:%s(%s)/S:%s(%s) traded=L:%s/S:%s | %s | %s",
         primary_ts,
         flags["close"],
-        flags["st_bull_flip"],
-        flags["st_bear_flip"],
-        flags["st_bull"],
+        _st_summary(flags),
+        _ema_summary(flags),
         flags["adx"],
         flags["adx_ok_long"],
-        flags["ema_ok_long"],
+        flags["adx_ok_short"],
         state_before["position_size"],
         state_before["pending_adx_long"],
         state_before["adx_wait_bars_left_long"],
+        state_before["pending_adx_short"],
+        state_before["adx_wait_bars_left_short"],
         state_before["traded_in_bull_trend"],
+        state_before["traded_in_bear_trend"],
+        _pending_ema_summary(state_before, result.updates, flags),
         reason,
     )

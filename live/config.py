@@ -72,6 +72,7 @@ class LiveConfig:
     kite_fallback_on_error: bool
     session_start: time
     session_end: time
+    order_fill_timeout_sec: float
 
     @property
     def is_live(self) -> bool:
@@ -109,6 +110,7 @@ def build_live_config(config_root: Dict[str, Any]) -> LiveConfig:
         kite_fallback_on_error=bool(live.get("kite_fallback_on_error", True)),
         session_start=_parse_hhmm(live.get("session_start", "09:15"), time(9, 15)),
         session_end=_parse_hhmm(live.get("session_end", "15:30"), time(15, 30)),
+        order_fill_timeout_sec=float(live.get("order_fill_timeout_sec", 8.0)),
     )
 
 

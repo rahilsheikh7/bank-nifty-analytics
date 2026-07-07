@@ -36,7 +36,7 @@ from live.feed import MinuteAggregator, PrimaryBarClock, extract_index_ticks
 from live.neo_client import make_broker
 from live.neo_session import ensure_trade_session, is_token_stale
 from live.persistence import reconcile_with_broker
-from live.safety import OrderTracker
+from live.safety import OrderFillWatcher, OrderTracker
 from live.warmup import build_warm_1min
 
 IST = "Asia/Kolkata"
@@ -59,6 +59,7 @@ class LiveRunner:
         self.live_cfg = None
         self.bt_config = None
         self.creds = None
+        self.order_fill_watcher = OrderFillWatcher()
         self.order_tracker = OrderTracker()
         self._reconnect_delay = 1.0
         self._max_reconnect_delay = 60.0
@@ -131,9 +132,15 @@ class LiveRunner:
                 return
         if not isinstance(data, dict):
             return
+        if data.get("type") == "cn" or data.get("task") == "cn":
+            return
+
+        self.order_fill_watcher.ingest(data)
         oid = str(data.get("nOrdNo", data.get("order_id", "")))
-        if oid and self.order_tracker.is_new(oid):
-            logger.info("Order update %s status=%s", oid, data.get("ordSt", data.get("status")))
+        status = str(data.get("ordSt", data.get("status", "")))
+        avg_price = data.get("avgPrc", data.get("avgPrice", data.get("trdPrc", "")))
+        if oid and self.order_tracker.should_log(oid, status):
+            logger.info("Order feed %s status=%s avg=%s", oid, status, avg_price)
 
     def _on_ws_message(self, message: Any) -> None:
         if not self.running:
@@ -464,8 +471,26 @@ class LiveRunner:
         except Exception as exc:
             logger.warning("Could not fetch limits: %s", exc)
 
+        try:
+            expiry = self.broker.nearest_expiry()
+            ltp = self.broker.get_index_ltp()
+            if ltp is not None:
+                self.broker.resolve_atm_legs(ltp, expiry)
+                logger.info("Pre-warmed option scrips for expiry=%s index=%.2f", expiry, ltp)
+            else:
+                logger.info("Pre-warmed expiry=%s (ATM legs will resolve on first entry tick)", expiry)
+        except Exception as exc:
+            logger.warning("Option scrip pre-warm failed: %s", exc)
+
         logger.info("Initializing strategy engine (lots=%d)...", self.live_cfg.lots)
-        self.trader = LiveTrader(self.broker, self.live_cfg, self.bt_config, config_root, df_1m)
+        self.trader = LiveTrader(
+            self.broker,
+            self.live_cfg,
+            self.bt_config,
+            config_root,
+            df_1m,
+            order_fill_watcher=self.order_fill_watcher,
+        )
         if not self._warmup_ready:
             self.trader.allow_entries = False
             self.trader.entries_disabled_reason = f"warmup not ready ({warmup_status.message})"

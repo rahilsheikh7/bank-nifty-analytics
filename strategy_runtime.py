@@ -85,6 +85,52 @@ def _flip_columns(config: "BacktestConfig") -> Tuple[str, str]:
     return "st_bull_flip_short", "st_bear_flip_short"
 
 
+def _evaluate_flat_entry(
+    *,
+    bar: pd.Series,
+    bar_index: int,
+    df: pd.DataFrame,
+    state_manager: StateManager,
+    signal_engine: SignalEngine,
+    config: "BacktestConfig",
+) -> Tuple[Optional[Signal], Dict[str, Any]]:
+    state = state_manager.state
+    volume_window = df.iloc[
+        bar_index : min(bar_index + signal_engine.volume_candle_lookahead, len(df))
+    ]
+    return signal_engine.evaluate_entry_conditions(
+        bar=bar,
+        position_size=0,
+        traded_in_bull_trend=state.traded_in_bull_trend if config.enable_long_entries else True,
+        traded_in_bear_trend=state.traded_in_bear_trend if config.enable_short_entries else True,
+        pending_long_ema_wait=state.pending_long_ema_wait if config.enable_long_entries else False,
+        pending_short_ema_wait=state.pending_short_ema_wait if config.enable_short_entries else False,
+        pending_first_hour_long=state.pending_first_hour_long if config.enable_long_entries else False,
+        pending_first_hour_short=state.pending_first_hour_short if config.enable_short_entries else False,
+        pending_first_hour_trigger_long=state.pending_first_hour_trigger_long
+        if config.enable_long_entries
+        else "",
+        pending_first_hour_trigger_short=state.pending_first_hour_trigger_short
+        if config.enable_short_entries
+        else "",
+        pending_first_hour_deferred_long=state.pending_first_hour_deferred_long
+        if config.enable_long_entries
+        else None,
+        pending_first_hour_deferred_short=state.pending_first_hour_deferred_short
+        if config.enable_short_entries
+        else None,
+        pending_adx_long=state.pending_adx_long if config.enable_long_entries else False,
+        pending_adx_short=state.pending_adx_short if config.enable_short_entries else False,
+        adx_wait_bars_left_long=state.adx_wait_bars_left_long if config.enable_long_entries else 0,
+        adx_wait_bars_left_short=state.adx_wait_bars_left_short if config.enable_short_entries else 0,
+        adx_wait_trigger_long=state.adx_wait_trigger_long if config.enable_long_entries else "",
+        adx_wait_trigger_short=state.adx_wait_trigger_short if config.enable_short_entries else "",
+        deferred_ema_cross_long=state.deferred_ema_cross_long if config.enable_long_entries else None,
+        deferred_ema_cross_short=state.deferred_ema_cross_short if config.enable_short_entries else None,
+        volume_window=volume_window,
+    )
+
+
 def step_bar(
     *,
     bar: pd.Series,
@@ -126,39 +172,13 @@ def step_bar(
 
     state = state_manager.state
     if state.position_size == 0 and not skip_entry:
-        volume_window = df.iloc[
-            bar_index : min(bar_index + signal_engine.volume_candle_lookahead, len(df))
-        ]
-        entry_signal, updates = signal_engine.evaluate_entry_conditions(
+        entry_signal, updates = _evaluate_flat_entry(
             bar=bar,
-            position_size=0,
-            traded_in_bull_trend=state.traded_in_bull_trend if config.enable_long_entries else True,
-            traded_in_bear_trend=state.traded_in_bear_trend if config.enable_short_entries else True,
-            pending_long_ema_wait=state.pending_long_ema_wait if config.enable_long_entries else False,
-            pending_short_ema_wait=state.pending_short_ema_wait if config.enable_short_entries else False,
-            pending_first_hour_long=state.pending_first_hour_long if config.enable_long_entries else False,
-            pending_first_hour_short=state.pending_first_hour_short if config.enable_short_entries else False,
-            pending_first_hour_trigger_long=state.pending_first_hour_trigger_long
-            if config.enable_long_entries
-            else "",
-            pending_first_hour_trigger_short=state.pending_first_hour_trigger_short
-            if config.enable_short_entries
-            else "",
-            pending_first_hour_deferred_long=state.pending_first_hour_deferred_long
-            if config.enable_long_entries
-            else None,
-            pending_first_hour_deferred_short=state.pending_first_hour_deferred_short
-            if config.enable_short_entries
-            else None,
-            pending_adx_long=state.pending_adx_long if config.enable_long_entries else False,
-            pending_adx_short=state.pending_adx_short if config.enable_short_entries else False,
-            adx_wait_bars_left_long=state.adx_wait_bars_left_long if config.enable_long_entries else 0,
-            adx_wait_bars_left_short=state.adx_wait_bars_left_short if config.enable_short_entries else 0,
-            adx_wait_trigger_long=state.adx_wait_trigger_long if config.enable_long_entries else "",
-            adx_wait_trigger_short=state.adx_wait_trigger_short if config.enable_short_entries else "",
-            deferred_ema_cross_long=state.deferred_ema_cross_long if config.enable_long_entries else None,
-            deferred_ema_cross_short=state.deferred_ema_cross_short if config.enable_short_entries else None,
-            volume_window=volume_window,
+            bar_index=bar_index,
+            df=df,
+            state_manager=state_manager,
+            signal_engine=signal_engine,
+            config=config,
         )
         apply_state_updates(state_manager, updates)
 
@@ -169,5 +189,17 @@ def step_bar(
             entry_signal = None
         if skip_entry:
             entry_signal = None
+    elif exit_signal and exit_signal.exit_type == ExitType.ST_FLIP and not skip_entry:
+        # No same-bar reversal, but preserve the flip's pending EMA/ADX state for
+        # the next eligible entry after the exit is applied by the caller.
+        _entry_signal, updates = _evaluate_flat_entry(
+            bar=bar,
+            bar_index=bar_index,
+            df=df,
+            state_manager=state_manager,
+            signal_engine=signal_engine,
+            config=config,
+        )
+        apply_state_updates(state_manager, updates)
 
     return StepBarResult(entry_signal=entry_signal, exit_signal=exit_signal, updates=updates)
