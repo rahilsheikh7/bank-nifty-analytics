@@ -10,11 +10,12 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from backtest import BacktestConfig, prepare_backtest_data
-from indicators import timeframe_to_rule
+from indicators import timeframe_to_rule, timeframe_to_timedelta
 from live.bar_decision_log import log_primary_bar_decision, snapshot_state
 from live.config import LiveConfig
+from live.direct_symbols import DirectSymbolResolver
 from live.neo_client import BUY, Leg, LegOrder, NeoBroker, SELL
-from live.persistence import LivePosition, load_state, save_state
+from live.persistence import LivePosition, PendingFinalExit, load_state, save_state
 from live.safety import OrderFillWatcher, legs_filled, place_legs_safe, square_off_safe
 from strategy import ExitSignal, ExitType, Signal, SignalEngine, SignalType, StateManager, Trade
 from strategy_runtime import step_bar
@@ -43,6 +44,9 @@ class LiveTrader:
         self.order_fill_watcher = order_fill_watcher
         self._last_index_price: Optional[float] = None
         self.prepared: Optional[pd.DataFrame] = None
+        self.direct_symbol_resolver: Optional[DirectSymbolResolver] = (
+            DirectSymbolResolver(live_cfg) if live_cfg.fast_direct_orders else None
+        )
 
         self.signal_engine = SignalEngine(
             sl_pct_long=bt_config.sl_pct_long,
@@ -66,6 +70,7 @@ class LiveTrader:
             contracts_per_trade=bt_config.contracts,
         )
         self.live_position: Optional[LivePosition] = None
+        self.pending_final_exit: Optional[PendingFinalExit] = None
         self.flat_until_next_bar = False
         self.allow_entries = True
         self.entries_disabled_reason = ""
@@ -81,7 +86,7 @@ class LiveTrader:
         )
 
     def _restore_state(self) -> None:
-        ss, lp, flat, last_session_date = load_state()
+        ss, lp, flat, last_session_date, pending_final_exit = load_state()
         if ss is not None:
             self.state_manager.state = ss
             logger.info("Restored strategy state (position_size=%s)", ss.position_size)
@@ -100,19 +105,23 @@ class LiveTrader:
         else:
             logger.info("No open live position in state file")
 
-        today = date.today().isoformat()
-        if (
-            flat
-            and self.state_manager.state.position_size == 0
-            and last_session_date
-            and last_session_date != today
-        ):
-            logger.info(
-                "Clearing stale flat_until_next_bar from prior session (%s)",
-                last_session_date,
+        self.pending_final_exit = pending_final_exit
+        if self.pending_final_exit is not None:
+            logger.warning(
+                "Restored pending final-bar exit: %s %s @ %.2f from %s (%s)",
+                self.pending_final_exit.exit_type,
+                self.pending_final_exit.direction,
+                self.pending_final_exit.signal_price,
+                self.pending_final_exit.signal_time,
+                self.pending_final_exit.reason,
             )
-            flat = False
-        self.flat_until_next_bar = flat
+
+        if flat:
+            logger.info(
+                "Ignoring restored flat_until_next_bar cooldown; intrabar SL/TP exits "
+                "now allow entry checks at the same primary-bar close"
+            )
+        self.flat_until_next_bar = False
 
     def _persist(self) -> None:
         save_state(
@@ -120,6 +129,7 @@ class LiveTrader:
             self.live_position,
             flat_until_next_bar=self.flat_until_next_bar,
             last_session_date=date.today().isoformat(),
+            pending_final_exit=self.pending_final_exit,
         )
 
     def update_df(self, df_1m: pd.DataFrame) -> None:
@@ -128,6 +138,15 @@ class LiveTrader:
     def _reprepare(self) -> pd.DataFrame:
         self.prepared = prepare_backtest_data(self.df_1m, self.strategy_cfg, self.bt_config)
         return self.prepared
+
+    def _is_final_primary_bar(self, primary_ts: pd.Timestamp) -> bool:
+        ts = pd.Timestamp(primary_ts)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(IST)
+        else:
+            ts = ts.tz_convert(IST)
+        bar_end = ts + timeframe_to_timedelta(self.bt_config.primary_timeframe)
+        return bar_end.time() >= self.live_cfg.session_end
 
     def _leg_qty(self, leg: Leg) -> int:
         return self.live_cfg.lots * leg.lot_size
@@ -179,8 +198,12 @@ class LiveTrader:
         if isinstance(bar_index, slice):
             bar_index = int(bar_index.start or 0)
 
-        skip_entry = self.flat_until_next_bar
-        if skip_entry:
+        final_primary_bar = self._is_final_primary_bar(primary_ts)
+        # Intrabar SL/TP exits are handled immediately on ticks, but the
+        # completed-bar close should still be allowed to produce the next entry.
+        # The session-close bar remains the only hard entry block.
+        skip_entry = final_primary_bar
+        if self.flat_until_next_bar:
             self.flat_until_next_bar = False
 
         state_before = snapshot_state(self.state_manager)
@@ -204,6 +227,18 @@ class LiveTrader:
             signal_engine=self.signal_engine,
         )
 
+        if final_primary_bar and result.exit_signal:
+            self._defer_final_bar_exit(result.exit_signal, bar)
+            self._persist()
+            return
+
+        if final_primary_bar and result.entry_signal:
+            logger.info(
+                "Final primary bar %s: dropping new entry signal at session close",
+                primary_ts,
+            )
+            result.entry_signal = None
+
         if result.exit_signal:
             self._handle_exit(result.exit_signal, bar)
 
@@ -214,6 +249,7 @@ class LiveTrader:
 
     def on_index_tick(self, price: float, ts: Optional[datetime] = None) -> None:
         self._last_index_price = float(price)
+        self._maybe_execute_pending_final_exit(float(price), ts)
         if not self.live_cfg.intrabar_exit:
             return
         state = self.state_manager.state
@@ -232,7 +268,73 @@ class LiveTrader:
         exit_signal = ExitSignal(exit_type, ts_pd, price, state.entry_price, pnl)
         logger.info("Intrabar %s @ index %.2f (sl=%.2f tp=%.2f)", exit_type.value, price, state.stop_loss, state.take_profit)
         self._handle_exit(exit_signal, None, index_exit_price=price)
-        self.flat_until_next_bar = True
+        self.flat_until_next_bar = False
+
+    def _defer_final_bar_exit(self, exit_signal: ExitSignal, bar: pd.Series) -> None:
+        state = self.state_manager.state
+        if state.position_size == 0 or self.live_position is None:
+            return
+
+        direction = "long" if state.position_size > 0 else "short"
+        if exit_signal.exit_type == ExitType.ST_FLIP:
+            if state.position_size > 0:
+                self.state_manager.set_pending_short_ema_wait()
+            else:
+                self.state_manager.set_pending_long_ema_wait()
+
+        self.pending_final_exit = PendingFinalExit(
+            exit_type=exit_signal.exit_type.value,
+            direction=direction,
+            signal_time=pd.Timestamp(exit_signal.timestamp).isoformat(),
+            signal_price=float(exit_signal.exit_price),
+            reason="final_primary_bar",
+        )
+        logger.warning(
+            "Final primary bar exit deferred overnight: %s %s @ %.2f; no orders sent at session close",
+            exit_signal.exit_type.value,
+            direction,
+            exit_signal.exit_price,
+        )
+
+    def _maybe_execute_pending_final_exit(
+        self,
+        price: float,
+        ts: Optional[datetime] = None,
+    ) -> None:
+        if self.pending_final_exit is None:
+            return
+        if self.live_position is None or self.state_manager.state.position_size == 0:
+            logger.warning("Clearing pending final-bar exit because no live position is restored")
+            self.pending_final_exit = None
+            self._persist()
+            return
+
+        now = pd.Timestamp(ts or datetime.now())
+        if now.tzinfo is None:
+            now = now.tz_localize(IST)
+        else:
+            now = now.tz_convert(IST)
+        signal_day = pd.Timestamp(self.pending_final_exit.signal_time).date()
+        if now.date() <= signal_day:
+            return
+
+        state = self.state_manager.state
+        is_long = state.position_size > 0
+        pnl = (price - state.entry_price) if is_long else (state.entry_price - price)
+        try:
+            exit_type = ExitType(self.pending_final_exit.exit_type)
+        except ValueError:
+            exit_type = ExitType.ST_FLIP
+        logger.warning(
+            "Executing pending final-bar exit from %s at next-session price %.2f",
+            self.pending_final_exit.signal_time,
+            price,
+        )
+        exit_signal = ExitSignal(exit_type, now, price, state.entry_price, pnl)
+        self._handle_exit(exit_signal, None, index_exit_price=price)
+        if self.state_manager.state.position_size == 0:
+            self.pending_final_exit = None
+            self._persist()
 
     def _handle_entry(self, signal: Signal) -> None:
         if self.state_manager.state.position_size != 0:
@@ -258,17 +360,39 @@ class LiveTrader:
             else:
                 index_price -= self.bt_config.slippage_points
 
-        expiry = self.broker.nearest_expiry()
-        legs = self.broker.resolve_atm_legs(index_price, expiry)
         strike = self.broker.atm_strike(index_price)
-        if int(legs["ce"].strike) != strike or int(legs["pe"].strike) != strike:
-            logger.error(
-                "Entry aborted: resolved leg strike mismatch expected=%s CE=%s PE=%s",
+        check_margin = True
+        if self.direct_symbol_resolver is not None:
+            try:
+                expiry_info = self.direct_symbol_resolver.selected_expiry()
+                expiry = expiry_info.expiry
+                legs = self.direct_symbol_resolver.resolve_legs(
+                    strike=strike,
+                    expiry_info=expiry_info,
+                )
+            except Exception as exc:
+                logger.error("Entry aborted: fast direct symbol resolution failed: %s", exc)
+                return
+            check_margin = self.live_cfg.fast_direct_check_margin
+            logger.info(
+                "Fast direct legs from %s: expiry=%s strike=%d CE=%s PE=%s",
+                self.direct_symbol_resolver.csv_path,
+                expiry,
                 strike,
-                legs["ce"].strike,
-                legs["pe"].strike,
+                legs["ce"].trading_symbol,
+                legs["pe"].trading_symbol,
             )
-            return
+        else:
+            expiry = self.broker.nearest_expiry()
+            legs = self.broker.resolve_atm_legs(index_price, expiry)
+            if int(legs["ce"].strike) != strike or int(legs["pe"].strike) != strike:
+                logger.error(
+                    "Entry aborted: resolved leg strike mismatch expected=%s CE=%s PE=%s",
+                    strike,
+                    legs["ce"].strike,
+                    legs["pe"].strike,
+                )
+                return
         logger.info(
             "Entry audit %s: index=%.2f strike=%d distance=%.2f expiry=%s lot_size=%d lots=%d",
             direction,
@@ -286,7 +410,7 @@ class LiveTrader:
                 self.broker,
                 orders,
                 tag=f"entry_{direction}",
-                check_margin=True,
+                check_margin=check_margin,
                 order_watcher=self.order_fill_watcher,
                 fill_timeout_sec=self.live_cfg.order_fill_timeout_sec,
             )
@@ -388,6 +512,29 @@ class LiveTrader:
         self.live_position = None
         self._persist()
         logger.info("EXIT %s @ index %.2f (%s)", pos.direction, exit_signal.exit_price, exit_signal.exit_type.value)
+
+    def clear_manual_broker_exit(self, *, open_symbols: set[str]) -> None:
+        """Clear local position state after broker confirms both saved legs are flat."""
+        if self.live_position is None and self.state_manager.state.position_size == 0:
+            return
+
+        pos = self.live_position
+        state = self.state_manager.state
+        logger.warning(
+            "Manual/broker exit detected; clearing local live position state "
+            "(saved=%s broker_open=%s)",
+            sorted({pos.ce_symbol, pos.pe_symbol}) if pos is not None else [],
+            sorted(open_symbols),
+        )
+        state.position_size = 0
+        state.entry_price = 0.0
+        state.entry_time = None
+        state.stop_loss = 0.0
+        state.take_profit = 0.0
+        self.live_position = None
+        self.pending_final_exit = None
+        self.flat_until_next_bar = False
+        self._persist()
 
     def flatten_on_shutdown(self) -> None:
         if not self.live_cfg.flatten_on_shutdown or self.live_position is None:

@@ -73,6 +73,10 @@ class LiveConfig:
     session_start: time
     session_end: time
     order_fill_timeout_sec: float
+    fast_direct_orders: bool
+    scrip_symbol_expiry_csv: str
+    fast_direct_lot_size: int
+    fast_direct_check_margin: bool
 
     @property
     def is_live(self) -> bool:
@@ -101,7 +105,7 @@ def build_live_config(config_root: Dict[str, Any]) -> LiveConfig:
         expiry_roll_days=int(live.get("expiry_roll_days", 1)),
         intrabar_exit=bool(live.get("intrabar_exit", True)),
         square_off_on_exit=bool(live.get("square_off_on_exit", True)),
-        flatten_on_shutdown=bool(live.get("flatten_on_shutdown", True)),
+        flatten_on_shutdown=bool(live.get("flatten_on_shutdown", False)),
         warmup_sessions=int(live.get("warmup_sessions", 35)),
         warmup_max_bars=int(live.get("warmup_max_bars", 12000)),
         log_retention_days=int(live.get("log_retention_days", 3)),
@@ -111,6 +115,15 @@ def build_live_config(config_root: Dict[str, Any]) -> LiveConfig:
         session_start=_parse_hhmm(live.get("session_start", "09:15"), time(9, 15)),
         session_end=_parse_hhmm(live.get("session_end", "15:30"), time(15, 30)),
         order_fill_timeout_sec=float(live.get("order_fill_timeout_sec", 8.0)),
+        fast_direct_orders=bool(live.get("fast_direct_orders", False)),
+        scrip_symbol_expiry_csv=str(
+            live.get(
+                "scrip_symbol_expiry_csv",
+                "live/cache/scrip_master/banknifty_symbol_expiry.csv",
+            )
+        ),
+        fast_direct_lot_size=int(live.get("fast_direct_lot_size", 30)),
+        fast_direct_check_margin=bool(live.get("fast_direct_check_margin", False)),
     )
 
 

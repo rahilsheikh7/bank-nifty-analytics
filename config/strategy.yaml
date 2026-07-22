@@ -127,8 +127,12 @@ live:
   expiry_roll_days: 1          # roll to the next expiry this many days before expiry
   intrabar_exit: true          # true = SL/TP on every tick (diverges from bar-close backtest)
   square_off_on_exit: true
-  flatten_on_shutdown: true
+  flatten_on_shutdown: false
   order_fill_timeout_sec: 8     # wait for order websocket fills (both legs in parallel)
+  fast_direct_orders: true      # true = build BANKNIFTY symbols locally; skip search_scrip/margin on entry
+  scrip_symbol_expiry_csv: live/cache/scrip_master/banknifty_symbol_expiry.csv
+  fast_direct_lot_size: 30      # BANKNIFTY lot size used by direct symbol legs
+  fast_direct_check_margin: false
   warmup_sessions: 40           # max trading days kept in cache CSV
   warmup_max_bars: 15000        # ~200 hours of 1-min bars (32 sessions @ 375 min)
   log_retention_days: 3         # keep last N days in trading.log

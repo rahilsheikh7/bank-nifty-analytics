@@ -250,3 +250,42 @@ def is_place_order_ok(resp: Dict[str, Any]) -> bool:
             if data.get(key):
                 return True
     return status_l == "ok"
+
+
+def build_cancel_order_jdata(order_no: str, *, amo: str = "NO") -> Dict[str, str]:
+    return {"am": amo, "on": str(order_no)}
+
+
+def cancel_order_doc(session: ApiSession, order_no: str, *, amo: str = "NO") -> Dict[str, Any]:
+    """POST {baseUrl}/quick/order/cancel per Kotak documentation."""
+    jdata = build_cancel_order_jdata(order_no, amo=amo)
+    url = f"{session.base_url.rstrip('/')}/quick/order/cancel"
+    headers = _place_order_headers(session)
+    body = {"jData": json.dumps(jdata, separators=(",", ":"))}
+    with ipv6_only():
+        response = requests.post(url, headers=headers, data=body, timeout=30)
+    try:
+        payload: Dict[str, Any] = response.json()
+    except ValueError:
+        payload = {"stat": "Not_Ok", "emsg": response.text, "stCode": response.status_code}
+    if not isinstance(payload, dict):
+        payload = {"stat": "Not_Ok", "emsg": str(payload), "stCode": response.status_code}
+    payload["_http_status"] = response.status_code
+    payload["_request"] = {
+        "url": url,
+        "jData": jdata,
+        "headers": {**headers, "Auth": "(hidden)"},
+    }
+    return payload
+
+
+def is_cancel_order_ok(resp: Dict[str, Any]) -> bool:
+    status_l = str(resp.get("stat") or resp.get("status") or "").lower()
+    if status_l in {"not_ok", "not ok", "rejected", "error", "unknown"}:
+        return False
+    if resp.get("emsg") or resp.get("errMsg"):
+        return False
+    st_code = resp.get("stCode")
+    if st_code is not None and int(st_code) not in (200,):
+        return False
+    return status_l == "ok" or bool(resp.get("nOrdNo"))

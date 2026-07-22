@@ -14,6 +14,15 @@ logger = logging.getLogger("live.safety")
 
 TERMINAL_STATUSES = {"complete", "traded", "rejected", "cancelled", "canceled"}
 REJECT_CANCEL_STATUSES = {"rejected", "cancelled", "canceled"}
+ACCEPTED_STATUSES = {
+    "ok",
+    "open",
+    "placed",
+    "pending",
+    "complete",
+    "completed",
+    "traded",
+}
 
 
 class RateLimiter:
@@ -103,10 +112,19 @@ def _is_reject_or_cancel(status: str) -> bool:
     return "reject" in normalized or "cancel" in normalized
 
 
+def _is_order_accepted(ref: OrderRef) -> bool:
+    if not ref.order_id:
+        return False
+    normalized = _normalize_status(ref.status)
+    if _is_reject_or_cancel(normalized):
+        return False
+    return normalized in ACCEPTED_STATUSES
+
+
 def _is_fill_complete(ref: OrderRef) -> bool:
     if _is_reject_or_cancel(ref.status):
         return True
-    return ref.avg_price > 0
+    return ref.avg_price > 0 or _is_order_accepted(ref)
 
 
 def legs_filled(refs: List[OrderRef]) -> bool:
@@ -115,7 +133,7 @@ def legs_filled(refs: List[OrderRef]) -> bool:
     for ref in refs:
         if _is_reject_or_cancel(ref.status):
             return False
-        if not ref.is_paper and ref.avg_price <= 0:
+        if not ref.is_paper and not _is_fill_complete(ref):
             return False
     return True
 
@@ -134,7 +152,10 @@ class OrderFillWatcher:
             return
         with self._lock:
             self._orders[ref.order_id] = ref
-            self._events[ref.order_id] = threading.Event()
+            event = threading.Event()
+            self._events[ref.order_id] = event
+            if _is_fill_complete(ref):
+                event.set()
             buffered = self._buffer.pop(ref.order_id, None)
         if buffered:
             self.ingest(buffered)
@@ -201,16 +222,29 @@ class OrderFillWatcher:
             _rest_fallback_parallel(broker, pending, timeout_sec=min(2.0, timeout_sec))
 
         for ref in live_refs:
-            if not _is_fill_complete(ref):
+            if _is_reject_or_cancel(ref.status):
                 logger.warning(
-                    "Order %s fill not confirmed (status=%s avg=%.2f)",
+                    "Order %s rejected/cancelled (status=%s avg=%.2f)",
                     ref.order_id,
                     ref.status,
                     ref.avg_price,
                 )
-            else:
+            elif ref.avg_price > 0:
                 logger.info(
                     "Order %s fill confirmed (status=%s avg=%.2f)",
+                    ref.order_id,
+                    ref.status,
+                    ref.avg_price,
+                )
+            elif _is_order_accepted(ref):
+                logger.info(
+                    "Order %s accepted (status=%s avg pending); tracking live position",
+                    ref.order_id,
+                    ref.status,
+                )
+            else:
+                logger.warning(
+                    "Order %s fill not confirmed (status=%s avg=%.2f)",
                     ref.order_id,
                     ref.status,
                     ref.avg_price,

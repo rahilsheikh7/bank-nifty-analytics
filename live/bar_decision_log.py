@@ -191,7 +191,7 @@ def _no_entry_reason(
     bt_config: BacktestConfig,
 ) -> str:
     if skip_entry:
-        return "entry skipped (flat_until_next_bar)"
+        return "entry skipped (final_primary_bar)"
     if state_before["position_size"] != 0:
         if result.exit_signal:
             return f"in position; exit={result.exit_signal.exit_type.value}"
@@ -258,6 +258,27 @@ def log_primary_bar_decision(
         skip_entry=skip_entry,
         bt_config=bt_config,
     )
+
+    if result.exit_signal and result.entry_signal:
+        sig = result.entry_signal
+        side = "LONG" if sig.signal_type.name == "BUY" else "SHORT"
+        condition = _entry_condition(side, sig.trigger, flags)
+        logger.info(
+            "Bar %s | EXIT %s @ %s + SIGNAL %s @ %s condition=%s | close=%s | %s | %s | ADX=%s adx_ok=%s | %s",
+            primary_ts,
+            result.exit_signal.exit_type.value,
+            _fmt_num(result.exit_signal.exit_price),
+            side,
+            _fmt_num(sig.price),
+            condition,
+            flags["close"],
+            _st_summary(flags),
+            _ema_summary(flags),
+            flags["adx"],
+            flags["adx_ok_long"] if side == "LONG" else flags["adx_ok_short"],
+            _pending_ema_summary(state_before, result.updates, flags),
+        )
+        return
 
     if result.entry_signal:
         sig = result.entry_signal

@@ -155,10 +155,11 @@ def step_bar(
     updates: Dict[str, Any] = {}
 
     state = state_manager.state
-    if state.position_size != 0:
+    pre_exit_position = state.position_size
+    if pre_exit_position != 0:
         exit_signal = signal_engine.check_exit_conditions(
             bar=bar,
-            position_size=state.position_size,
+            position_size=pre_exit_position,
             entry_price=state.entry_price,
             stop_loss=state.stop_loss,
             take_profit=state.take_profit,
@@ -190,9 +191,10 @@ def step_bar(
         if skip_entry:
             entry_signal = None
     elif exit_signal and exit_signal.exit_type == ExitType.ST_FLIP and not skip_entry:
-        # No same-bar reversal, but preserve the flip's pending EMA/ADX state for
-        # the next eligible entry after the exit is applied by the caller.
-        _entry_signal, updates = _evaluate_flat_entry(
+        # Allow an ST-flip exit to reverse on the same completed bar when the
+        # opposite side also satisfies the entry filters. The caller applies the
+        # exit first, then the returned entry.
+        entry_signal, updates = _evaluate_flat_entry(
             bar=bar,
             bar_index=bar_index,
             df=df,
@@ -201,5 +203,22 @@ def step_bar(
             config=config,
         )
         apply_state_updates(state_manager, updates)
+        if entry_signal:
+            exiting_long = pre_exit_position > 0
+            is_opposite = (
+                exiting_long and entry_signal.signal_type == SignalType.SELL
+            ) or (
+                not exiting_long and entry_signal.signal_type == SignalType.BUY
+            )
+            if not is_opposite:
+                entry_signal = None
+            elif (
+                (entry_signal.signal_type == SignalType.BUY and not config.enable_long_entries)
+                or (
+                    entry_signal.signal_type == SignalType.SELL
+                    and not config.enable_short_entries
+                )
+            ):
+                entry_signal = None
 
     return StepBarResult(entry_signal=entry_signal, exit_signal=exit_signal, updates=updates)

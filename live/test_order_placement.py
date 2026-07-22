@@ -10,6 +10,18 @@ Usage:
   python -m live.test_order_placement --place --yes
   python -m live.test_order_placement --place --yes --round-trip
   python -m live.test_order_placement --place --yes --round-trip --wait-seconds 15
+
+  # Fast path: token.json only — no login, parallel place
+  python -m live.test_order_placement --direct --expiry 28JUL2026 --direction short --place --yes
+  python -m live.test_order_placement --direct --expiry 28JUL2026 --direction short --place --yes --round-trip
+  python -m live.test_order_placement --direct --expiry 28JUL2026 --direction short --strike 57400 --exit-only --place --yes
+
+  # Cancel open orders by nest order number (nOrdNo from place response)
+  python -m live.test_order_placement --cancel 260708000632115 260708000632119 --yes
+
+Inspect search_scrip (no orders):
+  python -m live.inspect_scrip
+  python -m live.inspect_scrip --strike 57900 --expiry 28JUL2026 --option-type BOTH
 """
 from __future__ import annotations
 
@@ -19,6 +31,8 @@ import logging
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -26,7 +40,8 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from live.config import LiveConfig, build_live_config, load_live_config, load_neo_credentials
-from live.neo_client import BUY, Leg, LegOrder, NeoBroker, OrderRef, SELL, _extract_order_id
+from live.config import NeoCredentials
+from live.neo_client import BUY, Leg, LegOrder, NeoBroker, OrderRef, SELL, _extract_ltp, _extract_order_id
 from live.safety import check_margin_for_legs
 
 logger = logging.getLogger("live.test_order")
@@ -34,6 +49,160 @@ logger = logging.getLogger("live.test_order")
 NEO_FIN_KEY = "neotradeapi"
 DEFAULT_SESSION_FILE = Path(__file__).resolve().parent.parent / "api.txt"
 DEFAULT_TOKEN_FILE = Path(__file__).resolve().parent.parent / "token.json"
+
+_EXPIRY_RE = re.compile(r"^(\d{1,2})([A-Za-z]{3})(\d{4})$")
+
+
+def _timing(label: str, seconds: float) -> None:
+    print(f"  [timing] {label}: {seconds:.3f}s")
+
+
+@contextmanager
+def _timed(label: str):
+    t0 = time.perf_counter()
+    yield
+    _timing(label, time.perf_counter() - t0)
+
+
+def _atm_strike(index_price: float, step: int) -> int:
+    return int(round(index_price / step) * step)
+
+
+def _load_doc_session_standalone(
+    *,
+    token_file: Path,
+    session_file: Path,
+    use_session_file: bool,
+) -> tuple[ApiSession, str]:
+    if use_session_file:
+        file_session = load_api_session(session_file)
+        if file_session is None:
+            raise RuntimeError(f"Could not parse {session_file}")
+        return file_session, f"api.txt ({session_file})"
+
+    token_loaded = load_token_session(token_file)
+    if token_loaded:
+        session, meta = token_loaded
+        when = meta.get("generated_at") or "unknown time"
+        return session, f"token.json ({token_file}, generated {when})"
+
+    raise RuntimeError("No session: run python generate_neo_session.py")
+
+
+def _fetch_index_ltp_standalone(creds: NeoCredentials, live_cfg: LiveConfig) -> Optional[float]:
+    """Index LTP via quotes API — consumer_key only, no totp login."""
+    if not creds.consumer_key:
+        return None
+    try:
+        from neo_api_client import NeoAPI  # type: ignore
+        from neo_api_client.urls import BASE_URL
+    except ImportError:
+        return None
+    client = NeoAPI(environment="prod", consumer_key=creds.consumer_key)
+    client.configuration.base_url = BASE_URL
+    resp = client.quotes(
+        instrument_tokens=[
+            {"instrument_token": live_cfg.index_name, "exchange_segment": live_cfg.index_segment}
+        ],
+        quote_type="ltp",
+    )
+    return _extract_ltp(resp)
+
+
+def _use_fast_path(args: argparse.Namespace) -> bool:
+    if args.use_login_session or args.dump_session:
+        return False
+    if args.method != "doc":
+        return False
+    if args.verify_scrip:
+        return False
+    if args.cancel:
+        return True
+    if args.exit_only:
+        return True
+    return bool(args.direct)
+
+
+def _normalize_expiry(expiry: str) -> str:
+    """Normalize to DDMMMYYYY uppercase, e.g. 28JUL2026."""
+    raw = str(expiry or "").strip().upper().replace(" ", "")
+    m = _EXPIRY_RE.match(raw)
+    if not m:
+        raise ValueError(f"Invalid expiry {expiry!r}; use e.g. 28JUL2026 or 25AUG2026")
+    day, mon, year = m.groups()
+    return f"{int(day):02d}{mon}{year}"
+
+
+def build_option_symbol(underlying: str, expiry: str, strike: int, option_type: str) -> str:
+    """Build Neo trading symbol without search_scrip.
+
+    Pattern from scrip master (e.g. BANKNIFTY26JUL53000CE for 28JUL2026 @ 53000).
+    """
+    norm = _normalize_expiry(expiry)
+    m = _EXPIRY_RE.match(norm)
+    assert m is not None
+    _day, mon, year = m.groups()
+    yy = year[-2:]
+    ot = str(option_type).strip().upper()
+    if ot not in {"CE", "PE"}:
+        raise ValueError(f"option_type must be CE or PE, got {option_type!r}")
+    return f"{underlying.upper()}{yy}{mon}{int(strike)}{ot}"
+
+
+def build_direct_legs(
+    live_cfg: LiveConfig,
+    *,
+    strike: int,
+    expiry: str,
+    lot_size: int,
+) -> Dict[str, Leg]:
+    """Synthetic CE+PE legs from strike/expiry only (place order needs ts, not token)."""
+    expiry_norm = _normalize_expiry(expiry)
+    ce_sym = build_option_symbol(live_cfg.underlying_symbol, expiry_norm, strike, "CE")
+    pe_sym = build_option_symbol(live_cfg.underlying_symbol, expiry_norm, strike, "PE")
+    segment = live_cfg.option_segment
+    return {
+        "ce": Leg(
+            trading_symbol=ce_sym,
+            token="",
+            lot_size=int(lot_size),
+            strike=float(strike),
+            expiry=expiry_norm,
+            option_type="CE",
+            segment=segment,
+        ),
+        "pe": Leg(
+            trading_symbol=pe_sym,
+            token="",
+            lot_size=int(lot_size),
+            strike=float(strike),
+            expiry=expiry_norm,
+            option_type="PE",
+            segment=segment,
+        ),
+    }
+
+
+def _verify_symbols_with_scrip(
+    broker: NeoBroker,
+    legs: Dict[str, Leg],
+    expiry: str,
+) -> bool:
+    """Optional: compare built symbols against search_scrip (slow)."""
+    strike = int(legs["ce"].strike)
+    expiry_norm = _normalize_expiry(expiry)
+    ok = True
+    for ot in ("CE", "PE"):
+        key = ot.lower()
+        built = legs[key].trading_symbol
+        rows = broker._search(ot, strike=strike, expiry=expiry_norm)
+        api_sym = None
+        if rows:
+            api_sym = rows[0].get("pTrdSymbol") or rows[0].get("pSymbolName")
+        match = api_sym == built
+        print(f"  {ot}: built={built}  scrip={api_sym or '(not found)'}  {'OK' if match else 'MISMATCH'}")
+        ok = ok and match
+    return ok
 
 
 def _pp(obj: Any) -> str:
@@ -298,6 +467,98 @@ def place_order_doc(
     return payload
 
 
+def cancel_order_doc(session: ApiSession, order_no: str, *, amo: str = "NO") -> Dict[str, Any]:
+    """POST {baseUrl}/quick/order/cancel per Kotak documentation."""
+    jdata = {"am": amo, "on": str(order_no)}
+    url = f"{session.base_url.rstrip('/')}/quick/order/cancel"
+    headers = _place_order_headers_from_session(session)
+    body = {"jData": json.dumps(jdata, separators=(",", ":"))}
+    response = requests.post(url, headers=headers, data=body, timeout=30)
+    try:
+        payload: Dict[str, Any] = response.json()
+    except ValueError:
+        payload = {"stat": "Not_Ok", "emsg": response.text, "stCode": response.status_code}
+    if not isinstance(payload, dict):
+        payload = {"stat": "Not_Ok", "emsg": str(payload), "stCode": response.status_code}
+    payload["_http_status"] = response.status_code
+    payload["_request"] = {
+        "url": url,
+        "jData": jdata,
+        "session_source": session.summary(),
+        "headers": {**headers, "Auth": "(hidden)"},
+    }
+    return payload
+
+
+def _is_cancel_ok(resp: Dict[str, Any]) -> bool:
+    status_l = str(resp.get("stat") or resp.get("status") or "").lower()
+    if status_l in {"not_ok", "not ok", "rejected", "error", "unknown"}:
+        return False
+    if resp.get("emsg") or resp.get("errMsg"):
+        return False
+    st_code = resp.get("stCode")
+    if st_code is not None and int(st_code) not in (200,):
+        return False
+    return status_l == "ok" or bool(resp.get("nOrdNo"))
+
+
+def _cancel_order_filled(resp: Dict[str, Any]) -> bool:
+    err = str(resp.get("errMsg") or resp.get("emsg") or "").lower()
+    if "completed" in err or "traded" in err or "fill" in err:
+        return True
+    try:
+        return int(resp.get("stCode") or 0) in (1021,)
+    except (TypeError, ValueError):
+        return False
+
+
+def _cancel_orders(session: ApiSession, order_nos: List[str]) -> tuple[bool, bool]:
+    """Return (all_cancelled_ok, any_already_filled)."""
+    print("\n--- Cancelling orders (documented REST API) ---")
+    all_ok = True
+    any_filled = False
+    t_total = time.perf_counter()
+    for on in order_nos:
+        t0 = time.perf_counter()
+        resp = cancel_order_doc(session, on)
+        _timing(f"cancel {on}", time.perf_counter() - t0)
+        ok = _is_cancel_ok(resp)
+        if not ok and _cancel_order_filled(resp):
+            any_filled = True
+        all_ok = all_ok and ok
+        print(f"\n  Order: {on}")
+        print(f"    success?      : {ok}")
+        err = _order_error(resp)
+        if err:
+            print(f"    response      : {_pp(err)}")
+        print(f"    raw response  :\n{_pp(resp)}")
+    _timing("cancel total", time.perf_counter() - t_total)
+    return all_ok, any_filled
+
+
+def _square_off_legs(
+    live_cfg: LiveConfig,
+    entry_orders: List[LegOrder],
+    *,
+    doc_session: ApiSession,
+    tag_prefix: str,
+) -> tuple[bool, List[OrderRef]]:
+    exit_orders = _exit_orders_from_entry(entry_orders)
+    print("\n--- Square-off (reverse entry legs) ---")
+    for o in exit_orders:
+        side = "BUY" if o.side == BUY else "SELL"
+        print(f"  {side} {o.leg.trading_symbol} qty={o.quantity}")
+    return _place_legs(
+        None,
+        live_cfg,
+        exit_orders,
+        method="doc",
+        tag_prefix=tag_prefix,
+        doc_session=doc_session,
+        parallel=True,
+    )
+
+
 def place_order_sdk(
     broker: NeoBroker,
     leg: Leg,
@@ -378,28 +639,81 @@ def _report_leg(side_label: str, ref: OrderRef) -> bool:
     return ok
 
 
+def _place_one_doc(
+    live_cfg: LiveConfig,
+    order: LegOrder,
+    *,
+    tag_prefix: str,
+    doc_session: ApiSession,
+) -> tuple[str, OrderRef, float]:
+    side_label = "BUY" if order.side == BUY else "SELL"
+    tag = _unique_order_tag(tag_prefix, order.leg)
+    t0 = time.perf_counter()
+    resp = place_order_doc(live_cfg, order.leg, order.side, order.quantity, doc_session, tag=tag)
+    elapsed = time.perf_counter() - t0
+    ref = _to_order_ref(order.leg, order.side, order.quantity, resp)
+    return side_label, ref, elapsed
+
+
 def _place_legs(
-    broker: NeoBroker,
+    broker: Optional[NeoBroker],
     live_cfg: LiveConfig,
     orders: List[LegOrder],
     *,
     method: str,
     tag_prefix: str,
     doc_session: ApiSession,
-) -> bool:
+    parallel: bool = False,
+) -> tuple[bool, List[OrderRef]]:
     label = "documented REST API" if method == "doc" else "neo_api_client SDK"
-    print(f"\n--- Placing orders ({label}) ---")
+    mode = "parallel" if parallel and method == "doc" and len(orders) > 1 else "sequential"
+    print(f"\n--- Placing orders ({label}, {mode}) ---")
     all_ok = True
-    for o in orders:
-        side = "BUY" if o.side == BUY else "SELL"
-        tag = _unique_order_tag(tag_prefix, o.leg)
-        if method == "doc":
-            resp = place_order_doc(live_cfg, o.leg, o.side, o.quantity, doc_session, tag=tag)
-        else:
-            resp = place_order_sdk(broker, o.leg, o.side, o.quantity, tag=tag)
-        ref = _to_order_ref(o.leg, o.side, o.quantity, resp)
-        all_ok = _report_leg(side, ref) and all_ok
-    return all_ok
+    refs: List[OrderRef] = []
+    t_total = time.perf_counter()
+
+    if parallel and method == "doc" and len(orders) > 1:
+        results: List[Optional[tuple[str, OrderRef, float]]] = [None] * len(orders)
+        with ThreadPoolExecutor(max_workers=len(orders)) as pool:
+            futures = {
+                pool.submit(
+                    _place_one_doc,
+                    live_cfg,
+                    order,
+                    tag_prefix=tag_prefix,
+                    doc_session=doc_session,
+                ): idx
+                for idx, order in enumerate(orders)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                results[idx] = future.result()
+        for item in results:
+            if item is None:
+                continue
+            side_label, ref, leg_elapsed = item
+            refs.append(ref)
+            all_ok = _report_leg(side_label, ref) and all_ok
+            _timing(f"place {side_label} {ref.trading_symbol}", leg_elapsed)
+    else:
+        for o in orders:
+            side_label = "BUY" if o.side == BUY else "SELL"
+            tag = _unique_order_tag(tag_prefix, o.leg)
+            t0 = time.perf_counter()
+            if method == "doc":
+                resp = place_order_doc(live_cfg, o.leg, o.side, o.quantity, doc_session, tag=tag)
+            else:
+                if broker is None:
+                    raise RuntimeError("SDK place requires logged-in broker")
+                resp = place_order_sdk(broker, o.leg, o.side, o.quantity, tag=tag)
+            leg_elapsed = time.perf_counter() - t0
+            ref = _to_order_ref(o.leg, o.side, o.quantity, resp)
+            refs.append(ref)
+            all_ok = _report_leg(side_label, ref) and all_ok
+            _timing(f"place {side_label} {ref.trading_symbol}", leg_elapsed)
+
+    _timing("place total (all legs)", time.perf_counter() - t_total)
+    return all_ok, refs
 
 
 def session_from_broker(broker: NeoBroker) -> ApiSession:
@@ -474,6 +788,217 @@ def _resolve_doc_session(
     )
 
 
+def _run_fast_path(
+    args: argparse.Namespace,
+    live_cfg: LiveConfig,
+    creds: NeoCredentials,
+    lots: int,
+) -> int:
+    """token.json only: index -> symbol -> parallel place. No login, no limits."""
+    t_run = time.perf_counter()
+    print("=== Neo fast direct (token.json — no login, no limits) ===")
+    print(f"  product={live_cfg.product} order_type={live_cfg.order_type} lots={lots}")
+    print(f"  direction={args.direction}")
+    if args.place_cancel:
+        print(f"  place_cancel: wait {args.cancel_wait_seconds}s -> cancel (or square-off if MKT filled)")
+    if args.round_trip:
+        print(f"  round_trip: wait {args.wait_seconds}s -> square-off")
+    if args.exit_only:
+        print(f"  exit_only: square-off existing {args.direction} legs (no new entry)")
+
+    try:
+        t0 = time.perf_counter()
+        doc_session, doc_source = _load_doc_session_standalone(
+            token_file=args.token_file,
+            session_file=args.session_file,
+            use_session_file=args.use_session_file,
+        )
+        _timing("load session", time.perf_counter() - t0)
+
+        if args.cancel:
+            print(f"  session: {doc_source}")
+            if not args.yes:
+                print("\nDRY RUN — pass --yes to send cancel requests")
+                for on in args.cancel:
+                    print(f"  would cancel: {on}")
+                return 0
+            cancel_ok, _ = _cancel_orders(doc_session, args.cancel)
+            _timing("run total (cancel)", time.perf_counter() - t_run)
+            print("\n=== Cancel complete ===" if cancel_ok else "\n=== Cancel had failures ===")
+            return 0 if cancel_ok else 1
+
+        if not args.expiry:
+            print("--direct requires --expiry (e.g. 28JUL2026)", file=sys.stderr)
+            return 1
+
+        if args.index_price is not None:
+            index_price = args.index_price
+            print(f"  [timing] index LTP: skipped (--index-price {index_price:.2f})")
+        else:
+            t0 = time.perf_counter()
+            index_price = _fetch_index_ltp_standalone(creds, live_cfg)
+            _timing("index LTP fetch", time.perf_counter() - t0)
+
+        if args.strike is not None:
+            strike = int(args.strike)
+        elif index_price is not None:
+            strike = _atm_strike(index_price, live_cfg.strike_step)
+        else:
+            print("--direct needs --strike or --index-price (or live index LTP)", file=sys.stderr)
+            return 1
+
+        expiry_norm = _normalize_expiry(args.expiry)
+        t0 = time.perf_counter()
+        legs = build_direct_legs(
+            live_cfg,
+            strike=strike,
+            expiry=expiry_norm,
+            lot_size=args.lot_size,
+        )
+        _timing("direct symbol build", time.perf_counter() - t0)
+
+        print(f"\n--- Fast direct ---")
+        print(f"  session   : {doc_source}")
+        print(f"  expiry    : {expiry_norm}  strike={strike}  lot_size={args.lot_size}")
+        if index_price is not None:
+            print(f"  index LTP : {index_price:.2f}")
+        print(f"  CE        : {legs['ce'].trading_symbol}")
+        print(f"  PE        : {legs['pe'].trading_symbol}")
+
+        orders = _entry_orders(args.direction, legs, lots)
+        tag_prefix = f"test_{args.direction}"
+        print(f"\n--- {args.direction} entry legs ---")
+        for o in orders:
+            side = "BUY" if o.side == BUY else "SELL"
+            print(f"  {side} {o.leg.trading_symbol} qty={o.quantity}")
+
+        if not args.place:
+            if args.place_cancel:
+                print("\n  --place-cancel: place -> wait -> cancel (square-off if MKT filled)")
+            if args.round_trip:
+                print("\n  --round-trip: place -> wait -> square-off")
+            if args.exit_only:
+                print("\n  --exit-only: square-off only (use --strike if not ATM)")
+            _timing("run total (dry-run)", time.perf_counter() - t_run)
+            print("\n=== DRY RUN complete. Use --place --yes to send real orders. ===")
+            return 0
+
+        if args.exit_only:
+            if not args.yes:
+                prompt = "Type YES to square off (reverse legs): "
+                if input(prompt).strip() != "YES":
+                    print("Cancelled.")
+                    return 0
+            exit_ok, _ = _square_off_legs(
+                live_cfg,
+                orders,
+                doc_session=doc_session,
+                tag_prefix=f"exit_{args.direction}",
+            )
+            if exit_ok:
+                _timing("run total (exit-only)", time.perf_counter() - t_run)
+                print("\n=== Square-off complete. ===")
+            else:
+                _timing("run total (exit-only failed)", time.perf_counter() - t_run)
+                print("\n=== EXIT FAILED — position may still be open. ===", file=sys.stderr)
+            return 0 if exit_ok else 2
+
+        if args.round_trip and args.place_cancel:
+            print("Use either --round-trip or --place-cancel, not both", file=sys.stderr)
+            return 1
+
+        if args.exit_only and (args.round_trip or args.place_cancel):
+            print("--exit-only cannot be combined with --round-trip or --place-cancel", file=sys.stderr)
+            return 1
+
+        if args.round_trip and args.method == "both":
+            print("--round-trip does not support --method both; use doc", file=sys.stderr)
+            return 1
+
+        if not args.yes:
+            if args.place_cancel:
+                prompt = (
+                    f"Type YES to place entry, wait {args.cancel_wait_seconds}s, then cancel: "
+                )
+            elif args.round_trip:
+                prompt = (
+                    f"Type YES to place entry, wait {args.wait_seconds}s, then square off: "
+                )
+            else:
+                prompt = "Type YES to place both MKT legs (parallel): "
+            if input(prompt).strip() != "YES":
+                print("Cancelled.")
+                return 0
+
+        ok, entry_refs = _place_legs(
+            None,
+            live_cfg,
+            orders,
+            method="doc",
+            tag_prefix=tag_prefix,
+            doc_session=doc_session,
+            parallel=True,
+        )
+
+        if ok and args.place_cancel:
+            order_nos = [r.order_id for r in entry_refs if r.order_id]
+            if not order_nos:
+                print("Place succeeded but no nOrdNo returned — cannot cancel", file=sys.stderr)
+                _timing("run total (place-cancel, no ids)", time.perf_counter() - t_run)
+                return 2
+            print(f"\n--- Waiting {args.cancel_wait_seconds}s before cancel ---")
+            time.sleep(args.cancel_wait_seconds)
+            cancel_ok, any_filled = _cancel_orders(doc_session, order_nos)
+            if cancel_ok:
+                _timing("run total (place-cancel)", time.perf_counter() - t_run)
+                print("\n=== Place + cancel complete. ===")
+            elif any_filled:
+                print("\n--- MKT orders filled — squaring off instead of cancel ---")
+                exit_ok, _ = _square_off_legs(
+                    live_cfg,
+                    orders,
+                    doc_session=doc_session,
+                    tag_prefix=f"exit_{args.direction}",
+                )
+                ok = exit_ok
+                if exit_ok:
+                    _timing("run total (place + square-off)", time.perf_counter() - t_run)
+                    print("\n=== Place + square-off complete (filled MKT exit). ===")
+                else:
+                    _timing("run total (square-off failed)", time.perf_counter() - t_run)
+                    print("\n=== SQUARE-OFF FAILED — position may still be open. ===", file=sys.stderr)
+            else:
+                ok = False
+                _timing("run total (cancel failed)", time.perf_counter() - t_run)
+                print("\n=== CANCEL FAILED — see errors above. ===", file=sys.stderr)
+        elif ok and args.round_trip:
+            print(f"\n--- Waiting {args.wait_seconds}s before square-off ---")
+            time.sleep(args.wait_seconds)
+            exit_ok, _ = _square_off_legs(
+                live_cfg,
+                orders,
+                doc_session=doc_session,
+                tag_prefix=f"exit_{args.direction}",
+            )
+            ok = exit_ok
+            if exit_ok:
+                _timing("run total (round-trip)", time.perf_counter() - t_run)
+                print("\n=== Round trip complete (entry + exit). ===")
+            else:
+                _timing("run total (exit failed)", time.perf_counter() - t_run)
+                print("\n=== EXIT FAILED — position may still be open. ===", file=sys.stderr)
+        elif ok:
+            _timing("run total (entry only)", time.perf_counter() - t_run)
+            print("\n=== Order(s) accepted — check Neo order book. ===")
+        else:
+            _timing("run total (failed)", time.perf_counter() - t_run)
+            print("\n=== ORDER FAILED — see stat/emsg/errMsg/stCode above. ===", file=sys.stderr)
+        return 0 if ok else 2
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Test Kotak Neo order placement (standalone)")
     parser.add_argument("--direction", choices=("long", "short"), default="long")
@@ -487,10 +1012,26 @@ def main() -> int:
         help="After entry fills, wait then square off the same synthetic legs",
     )
     parser.add_argument(
+        "--place-cancel",
+        action="store_true",
+        help="Place entry, wait, cancel; if MKT already filled, square-off instead",
+    )
+    parser.add_argument(
+        "--exit-only",
+        action="store_true",
+        help="Square off only — reverse legs for --direction/--strike/--expiry (no new entry)",
+    )
+    parser.add_argument(
+        "--cancel-wait-seconds",
+        type=int,
+        default=10,
+        help="Seconds to wait before cancel when using --place-cancel (default 10)",
+    )
+    parser.add_argument(
         "--wait-seconds",
         type=int,
-        default=15,
-        help="Seconds to wait between entry and exit when using --round-trip (default 15)",
+        default=10,
+        help="Seconds between entry and square-off when using --round-trip (default 10)",
     )
     parser.add_argument(
         "--method",
@@ -525,6 +1066,44 @@ def main() -> int:
         action="store_true",
         help="Login and write session to api.txt (legacy), then exit",
     )
+    parser.add_argument(
+        "--direct",
+        action="store_true",
+        help="Build CE/PE trading symbols from --strike + --expiry (skip search_scrip)",
+    )
+    parser.add_argument(
+        "--strike",
+        type=int,
+        default=None,
+        help="Strike in index points (required with --direct unless --index-price given)",
+    )
+    parser.add_argument(
+        "--expiry",
+        default=None,
+        help="Expiry e.g. 28JUL2026 (required with --direct)",
+    )
+    parser.add_argument(
+        "--lot-size",
+        type=int,
+        default=30,
+        help="Lot size per leg when using --direct (default 30 for Bank Nifty)",
+    )
+    parser.add_argument(
+        "--skip-margin",
+        action="store_true",
+        help="Skip margin_required API before place (faster test)",
+    )
+    parser.add_argument(
+        "--verify-scrip",
+        action="store_true",
+        help="With --direct, also call search_scrip to verify built symbols match",
+    )
+    parser.add_argument(
+        "--cancel",
+        nargs="+",
+        metavar="ORDER_NO",
+        help="Cancel open order(s) by nest order number (nOrdNo from place response)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -532,29 +1111,79 @@ def main() -> int:
     config_root = load_live_config()
     live_cfg = build_live_config(config_root)
     creds = load_neo_credentials()
-    if not creds.consumer_key or not creds.mobile:
-        print("NEO_API_KEY and NEO_MOBILE required in .env", file=sys.stderr)
+    if not creds.consumer_key:
+        print("NEO_API_KEY required in .env", file=sys.stderr)
         return 1
 
     lots = args.lots if args.lots is not None else live_cfg.lots
-    broker = NeoBroker(creds, live_cfg)
 
-    print("=== Neo order placement test (standalone — live bot unchanged) ===")
-    print(f"  product={live_cfg.product} order_type={live_cfg.order_type} lots={lots}")
-    print(f"  direction={args.direction}  {'dry-run' if not args.place else f'LIVE method={args.method}'}")
-    if args.round_trip:
-        print(f"  round_trip: entry -> wait {args.wait_seconds}s -> exit")
-
-    broker.login()
-    try:
-        if args.dump_session:
+    if args.dump_session:
+        if not creds.mobile:
+            print("NEO_MOBILE required in .env for --dump-session", file=sys.stderr)
+            return 1
+        broker = NeoBroker(creds, live_cfg)
+        t_run = time.perf_counter()
+        with _timed("neo login"):
+            broker.login()
+        try:
             session = dump_session_file(broker, args.session_file)
             print(f"Wrote fresh session to {args.session_file}")
             print(_pp(session.summary()))
             print("\nSession tokens expire. For orders, refresh token.json: python generate_neo_session.py")
+            _timing("run total (dump-session)", time.perf_counter() - t_run)
             return 0
+        finally:
+            broker.logout()
 
-        limits = broker.limits()
+    if _use_fast_path(args):
+        return _run_fast_path(args, live_cfg, creds, lots)
+
+    if not creds.mobile:
+        print("NEO_MOBILE required in .env", file=sys.stderr)
+        return 1
+
+    broker = NeoBroker(creds, live_cfg)
+
+    print("=== Neo order placement test (standalone — live bot unchanged) ===")
+    if args.cancel:
+        print(f"  mode=cancel  orders={args.cancel}")
+    else:
+        print(f"  product={live_cfg.product} order_type={live_cfg.order_type} lots={lots}")
+        mode = "direct-symbol" if args.direct else "scrip-api"
+        print(f"  direction={args.direction}  mode={mode}  {'dry-run' if not args.place else f'LIVE method={args.method}'}")
+    if args.round_trip:
+        print(f"  round_trip: entry -> wait {args.wait_seconds}s -> exit")
+
+    t_run = time.perf_counter()
+    with _timed("neo login"):
+        broker.login()
+    try:
+        if args.cancel:
+            doc_session, doc_source = _resolve_doc_session(
+                broker,
+                token_file=args.token_file,
+                session_file=args.session_file,
+                use_login_session=args.use_login_session,
+                use_session_file=args.use_session_file,
+            )
+            print(f"\n--- Doc API will use: {doc_source} ---")
+            print(_pp(doc_session.summary()))
+            print("  Cancel order URL:", f"{doc_session.base_url.rstrip('/')}/quick/order/cancel")
+            if not args.yes:
+                print("\nDRY RUN — pass --yes to send cancel requests")
+                for on in args.cancel:
+                    print(f"  would cancel: {on}")
+                return 0
+            cancel_ok, _ = _cancel_orders(doc_session, args.cancel)
+            print("\n=== Cancel complete ===" if cancel_ok else "\n=== Cancel had failures (order may already be filled) ===")
+            return 0 if cancel_ok else 1
+
+        if args.direct and not args.expiry:
+            print("--direct requires --expiry (e.g. 28JUL2026)", file=sys.stderr)
+            return 1
+
+        with _timed("account limits"):
+            limits = broker.limits()
         print("\n--- Account limits ---")
         print(_pp(limits))
         if isinstance(limits, dict) and limits.get("Net") is not None:
@@ -593,22 +1222,64 @@ def main() -> int:
         print(_pp(doc_session.summary()))
         print("  Place order URL:", _place_order_url_from_session(doc_session))
 
-        index_price = args.index_price or broker.get_index_ltp()
-        if index_price is None:
-            print("Could not fetch index LTP; pass --index-price", file=sys.stderr)
-            return 1
+        if args.index_price is not None:
+            index_price = args.index_price
+            print(f"\n  [timing] index LTP: skipped (--index-price {index_price:.2f})")
+        else:
+            t0 = time.perf_counter()
+            index_price = broker.get_index_ltp()
+            _timing("index LTP fetch", time.perf_counter() - t0)
 
-        print(f"\n--- Index ---\n  {live_cfg.index_name} LTP: {index_price:.2f}")
+        if args.direct:
+            if args.strike is not None:
+                strike = int(args.strike)
+            elif index_price is not None:
+                strike = broker.atm_strike(index_price)
+            else:
+                print("--direct needs --strike or --index-price (or live index LTP)", file=sys.stderr)
+                return 1
+            expiry_norm = _normalize_expiry(args.expiry)
+            t0 = time.perf_counter()
+            legs = build_direct_legs(
+                live_cfg,
+                strike=strike,
+                expiry=expiry_norm,
+                lot_size=args.lot_size,
+            )
+            _timing("direct symbol build", time.perf_counter() - t0)
+            print(f"\n--- Direct symbol build (no search_scrip) ---")
+            print(f"  expiry={expiry_norm}  strike={strike}  lot_size={args.lot_size}")
+            print(f"  CE ts={legs['ce'].trading_symbol}")
+            print(f"  PE ts={legs['pe'].trading_symbol}")
+            if args.verify_scrip:
+                print("\n--- Scrip verify (slow) ---")
+                t0 = time.perf_counter()
+                verify_ok = _verify_symbols_with_scrip(broker, legs, expiry_norm)
+                _timing("scrip verify", time.perf_counter() - t0)
+                if not verify_ok:
+                    print("Scrip verify failed — built symbol may be wrong for this expiry/strike", file=sys.stderr)
+                    return 1
+            if index_price is not None:
+                print(f"\n--- Index ---\n  {live_cfg.index_name} LTP: {index_price:.2f}")
+                _strike_audit(broker, legs, index_price)
+        else:
+            if index_price is None:
+                print("Could not fetch index LTP; pass --index-price", file=sys.stderr)
+                return 1
 
-        legs = broker.resolve_atm_legs(index_price, broker.nearest_expiry())
-        if not _strike_audit(broker, legs, index_price):
-            return 1
+            print(f"\n--- Index ---\n  {live_cfg.index_name} LTP: {index_price:.2f}")
+
+            t0 = time.perf_counter()
+            legs = broker.resolve_atm_legs(index_price, broker.nearest_expiry())
+            _timing("scrip resolve_atm_legs", time.perf_counter() - t0)
+            if not _strike_audit(broker, legs, index_price):
+                return 1
 
         orders = _entry_orders(args.direction, legs, lots)
         print(f"\n--- Synthetic {args.direction} entry legs ---")
         for o in orders:
             side = "BUY" if o.side == BUY else "SELL"
-            print(f"  {side} {o.leg.trading_symbol} qty={o.quantity} token={o.leg.token}")
+            print(f"  {side} {o.leg.trading_symbol} qty={o.quantity} token={o.leg.token or '(not used for place)'}")
 
         print("\n--- Place Order jData preview ---")
         tag_prefix = f"test_{args.direction}"
@@ -617,8 +1288,14 @@ def main() -> int:
             tag = _unique_order_tag(tag_prefix, o.leg)
             print(f"  {side} (ig={tag}): {_pp(build_place_order_jdata(live_cfg, o.leg, o.side, o.quantity, tag=tag))}")
 
-        margin_ok = check_margin_for_legs(broker, orders)
-        print(f"\n  check_margin_for_legs: {'OK' if margin_ok else 'FAILED'}")
+        if args.skip_margin:
+            print("\n  check_margin_for_legs: SKIPPED (--skip-margin)")
+            margin_ok = True
+        else:
+            t0 = time.perf_counter()
+            margin_ok = check_margin_for_legs(broker, orders)
+            _timing("margin check", time.perf_counter() - t0)
+            print(f"\n  check_margin_for_legs: {'OK' if margin_ok else 'FAILED'}")
 
         if args.round_trip:
             exit_orders = _exit_orders_from_entry(orders)
@@ -628,15 +1305,53 @@ def main() -> int:
                 print(f"  {side} {o.leg.trading_symbol} qty={o.quantity} token={o.leg.token}")
 
         if not args.place:
-            print("\n=== DRY RUN complete. Use --place to send real orders. ===")
+            if args.place_cancel:
+                print("\n  --place-cancel: place -> wait -> cancel (square-off if MKT filled)")
+            if args.round_trip:
+                print("\n  --round-trip: place -> wait -> square-off")
+            if args.exit_only:
+                print("\n  --exit-only: square-off only")
+            _timing("run total (dry-run)", time.perf_counter() - t_run)
+            print("\n=== DRY RUN complete. Use --place --yes to send real orders. ===")
             return 0
+
+        if args.exit_only:
+            if not args.yes:
+                if input("Type YES to square off (reverse legs): ").strip() != "YES":
+                    print("Cancelled.")
+                    return 0
+            exit_ok, _ = _square_off_legs(
+                live_cfg,
+                orders,
+                doc_session=doc_session,
+                tag_prefix=f"exit_{args.direction}",
+            )
+            if exit_ok:
+                _timing("run total (exit-only)", time.perf_counter() - t_run)
+                print("\n=== Square-off complete. ===")
+            else:
+                _timing("run total (exit-only failed)", time.perf_counter() - t_run)
+                print("\n=== EXIT FAILED — position may still be open. ===", file=sys.stderr)
+            return 0 if exit_ok else 2
+
+        if not margin_ok and not args.skip_margin:
+            print("Margin check failed; use --skip-margin to force place in test", file=sys.stderr)
+            return 1
+
+        if args.round_trip and args.place_cancel:
+            print("Use either --round-trip or --place-cancel, not both", file=sys.stderr)
+            return 1
 
         if args.round_trip and args.method == "both":
             print("--round-trip does not support --method both; use doc or sdk", file=sys.stderr)
             return 1
 
         if not args.yes:
-            if args.round_trip:
+            if args.place_cancel:
+                prompt = (
+                    f"Type YES to place entry, wait {args.cancel_wait_seconds}s, then cancel: "
+                )
+            elif args.round_trip:
                 prompt = (
                     f"Type YES to place entry, wait {args.wait_seconds}s, then square off: "
                 )
@@ -646,37 +1361,80 @@ def main() -> int:
                 print("Cancelled.")
                 return 0
 
+        entry_refs: List[OrderRef] = []
         if args.method == "both":
-            ok_doc = _place_legs(broker, live_cfg, orders, method="doc", tag_prefix=tag_prefix, doc_session=doc_session)
-            ok_sdk = _place_legs(broker, live_cfg, orders, method="sdk", tag_prefix=tag_prefix, doc_session=doc_session)
+            ok_doc, refs_doc = _place_legs(
+                broker, live_cfg, orders, method="doc", tag_prefix=tag_prefix, doc_session=doc_session
+            )
+            ok_sdk, _ = _place_legs(
+                broker, live_cfg, orders, method="sdk", tag_prefix=tag_prefix, doc_session=doc_session
+            )
             ok = ok_doc or ok_sdk
+            entry_refs = refs_doc
             print(f"\n  doc: {'OK' if ok_doc else 'FAIL'} | sdk: {'OK' if ok_sdk else 'FAIL'}")
         else:
-            ok = _place_legs(
-                broker, live_cfg, orders, method=args.method, tag_prefix=tag_prefix, doc_session=doc_session
-            )
-
-        if ok and args.round_trip:
-            print(f"\n--- Waiting {args.wait_seconds}s before square-off ---")
-            time.sleep(args.wait_seconds)
-            exit_orders = _exit_orders_from_entry(orders)
-            exit_prefix = f"exit_{args.direction}"
-            exit_ok = _place_legs(
+            ok, entry_refs = _place_legs(
                 broker,
                 live_cfg,
-                exit_orders,
+                orders,
                 method=args.method,
-                tag_prefix=exit_prefix,
+                tag_prefix=tag_prefix,
                 doc_session=doc_session,
+                parallel=args.direct and args.method == "doc",
+            )
+
+        if ok and args.place_cancel:
+            order_nos = [r.order_id for r in entry_refs if r.order_id]
+            if not order_nos:
+                print("Place succeeded but no nOrdNo returned — cannot cancel", file=sys.stderr)
+                _timing("run total (place-cancel, no ids)", time.perf_counter() - t_run)
+                return 2
+            print(f"\n--- Waiting {args.cancel_wait_seconds}s before cancel ---")
+            time.sleep(args.cancel_wait_seconds)
+            cancel_ok, any_filled = _cancel_orders(doc_session, order_nos)
+            if cancel_ok:
+                _timing("run total (place-cancel)", time.perf_counter() - t_run)
+                print("\n=== Place + cancel complete. ===")
+            elif any_filled:
+                print("\n--- MKT orders filled — squaring off instead of cancel ---")
+                exit_ok, _ = _square_off_legs(
+                    live_cfg,
+                    orders,
+                    doc_session=doc_session,
+                    tag_prefix=f"exit_{args.direction}",
+                )
+                ok = exit_ok
+                if exit_ok:
+                    _timing("run total (place + square-off)", time.perf_counter() - t_run)
+                    print("\n=== Place + square-off complete (filled MKT exit). ===")
+                else:
+                    _timing("run total (square-off failed)", time.perf_counter() - t_run)
+                    print("\n=== SQUARE-OFF FAILED — position may still be open. ===", file=sys.stderr)
+            else:
+                ok = False
+                _timing("run total (cancel failed)", time.perf_counter() - t_run)
+                print("\n=== CANCEL FAILED — see errors above. ===", file=sys.stderr)
+        elif ok and args.round_trip:
+            print(f"\n--- Waiting {args.wait_seconds}s before square-off ---")
+            time.sleep(args.wait_seconds)
+            exit_ok, _ = _square_off_legs(
+                live_cfg,
+                orders,
+                doc_session=doc_session,
+                tag_prefix=f"exit_{args.direction}",
             )
             ok = exit_ok
             if exit_ok:
+                _timing("run total (round-trip)", time.perf_counter() - t_run)
                 print("\n=== Round trip complete (entry + exit). ===")
             else:
+                _timing("run total (exit failed)", time.perf_counter() - t_run)
                 print("\n=== EXIT FAILED — position may still be open. ===", file=sys.stderr)
         elif ok:
+            _timing("run total (entry only)", time.perf_counter() - t_run)
             print("\n=== Order(s) accepted — check Neo order book. ===")
         else:
+            _timing("run total (failed)", time.perf_counter() - t_run)
             print("\n=== ORDER FAILED — see stat/emsg/errMsg/stCode above. ===", file=sys.stderr)
         return 0 if ok else 2
     finally:

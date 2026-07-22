@@ -68,6 +68,36 @@ class LivePosition:
         return cls(**data)
 
 
+@dataclass
+class PendingFinalExit:
+    """Exit intent captured on the final primary bar, executed next session."""
+
+    exit_type: str
+    direction: str
+    signal_time: str
+    signal_price: float
+    reason: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PendingFinalExit":
+        return cls(**data)
+
+
+@dataclass
+class BrokerReconcileResult:
+    """Summary of saved-position vs broker-position reconciliation."""
+
+    open_symbols: set[str]
+    expected_symbols: set[str]
+    missing_symbols: set[str]
+    extra_symbols: set[str]
+    manual_exit_detected: bool = False
+    partial_mismatch: bool = False
+
+
 def strategy_state_to_dict(state: StrategyState) -> Dict[str, Any]:
     return {
         "position_size": state.position_size,
@@ -150,6 +180,7 @@ def save_state(
     *,
     flat_until_next_bar: bool = False,
     last_session_date: Optional[str] = None,
+    pending_final_exit: Optional[PendingFinalExit] = None,
 ) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -157,26 +188,36 @@ def save_state(
         "live_position": live_position.to_dict() if live_position else None,
         "flat_until_next_bar": flat_until_next_bar,
         "last_session_date": last_session_date,
+        "pending_final_exit": pending_final_exit.to_dict() if pending_final_exit else None,
     }
     POSITION_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     logger.debug("Saved live state to %s", POSITION_FILE)
 
 
-def load_state() -> tuple[Optional[StrategyState], Optional[LivePosition], bool, Optional[str]]:
+def load_state() -> tuple[
+    Optional[StrategyState],
+    Optional[LivePosition],
+    bool,
+    Optional[str],
+    Optional[PendingFinalExit],
+]:
     if not POSITION_FILE.exists():
-        return None, None, False, None
+        return None, None, False, None, None
     try:
         payload = json.loads(POSITION_FILE.read_text(encoding="utf-8"))
         ss = strategy_state_from_dict(payload.get("strategy_state", {}))
         lp = None
         if payload.get("live_position"):
             lp = LivePosition.from_dict(payload["live_position"])
+        pending = None
+        if payload.get("pending_final_exit"):
+            pending = PendingFinalExit.from_dict(payload["pending_final_exit"])
         flat = bool(payload.get("flat_until_next_bar", False))
         last_session = payload.get("last_session_date")
-        return ss, lp, flat, last_session if last_session else None
+        return ss, lp, flat, last_session if last_session else None, pending
     except Exception as exc:
         logger.warning("Could not load state file: %s", exc)
-        return None, None, False, None
+        return None, None, False, None, None
 
 
 def clear_state() -> None:
@@ -208,13 +249,21 @@ def _broker_open_symbols(positions_resp: Any) -> set[str]:
     return symbols
 
 
-def reconcile_with_broker(broker: Any, live_position: Optional[LivePosition]) -> None:
-    """Warn if persisted position does not match broker open legs."""
+def reconcile_with_broker(
+    broker: Any,
+    live_position: Optional[LivePosition],
+) -> Optional[BrokerReconcileResult]:
+    """Compare persisted live position with broker open legs.
+
+    A full manual/broker exit is detected only when both expected legs from the
+    saved live position are absent at the broker. Partial mismatches are left for
+    manual review because auto-clearing state could hide an orphan option leg.
+    """
     try:
         resp = broker.positions()
     except Exception as exc:
         logger.warning("Could not fetch broker positions for reconcile: %s", exc)
-        return
+        return None
 
     open_syms = _broker_open_symbols(resp)
     if live_position is None:
@@ -223,11 +272,18 @@ def reconcile_with_broker(broker: Any, live_position: Optional[LivePosition]) ->
                 "Broker has open positions %s but no saved live position; manual review required",
                 sorted(open_syms),
             )
-        return
+        return BrokerReconcileResult(
+            open_symbols=open_syms,
+            expected_symbols=set(),
+            missing_symbols=set(),
+            extra_symbols=open_syms,
+        )
 
     expected = {live_position.ce_symbol, live_position.pe_symbol}
     missing = expected - open_syms
     extra = open_syms - expected
+    manual_exit_detected = missing == expected
+    partial_mismatch = bool(missing) and not manual_exit_detected
     if missing or extra:
         logger.warning(
             "Position mismatch: saved=%s broker_open=%s missing=%s extra=%s",
@@ -238,3 +294,11 @@ def reconcile_with_broker(broker: Any, live_position: Optional[LivePosition]) ->
         )
     else:
         logger.info("Broker positions reconcile OK for %s", sorted(expected))
+    return BrokerReconcileResult(
+        open_symbols=open_syms,
+        expected_symbols=expected,
+        missing_symbols=missing,
+        extra_symbols=extra,
+        manual_exit_detected=manual_exit_detected,
+        partial_mismatch=partial_mismatch,
+    )

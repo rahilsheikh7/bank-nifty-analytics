@@ -31,9 +31,11 @@ from live.config import (
     load_live_config,
     load_neo_credentials,
 )
+from live.direct_symbols import DirectSymbolResolver
 from live.engine import LiveTrader
 from live.feed import MinuteAggregator, PrimaryBarClock, extract_index_ticks
 from live.neo_client import make_broker
+from live.neo_place_order import DEFAULT_TOKEN_FILE, load_token_session
 from live.neo_session import ensure_trade_session, is_token_stale
 from live.persistence import reconcile_with_broker
 from live.safety import OrderFillWatcher, OrderTracker
@@ -46,6 +48,33 @@ logger = logging.getLogger("live.runner")
 def _in_session(ts: pd.Timestamp, live_cfg) -> bool:
     t = ts.tz_convert(IST).time() if ts.tzinfo else ts.time()
     return live_cfg.session_start <= t <= live_cfg.session_end
+
+
+def _validate_fast_direct_inputs(live_cfg) -> None:
+    """Fail fast if daily CSV/token preconditions are missing."""
+    resolver = DirectSymbolResolver(live_cfg)
+    expiry_info = resolver.selected_expiry()
+    logger.info(
+        "Fast direct orders enabled: csv=%s selected_expiry=%s symbols=%d lot_size=%d check_margin=%s",
+        resolver.csv_path,
+        expiry_info.expiry,
+        resolver.symbol_count,
+        live_cfg.fast_direct_lot_size,
+        live_cfg.fast_direct_check_margin,
+    )
+
+    token_loaded = load_token_session(DEFAULT_TOKEN_FILE)
+    if token_loaded is None:
+        raise RuntimeError(
+            f"Fast direct orders require {DEFAULT_TOKEN_FILE}; run python generate_neo_session.py"
+        )
+    if is_token_stale(DEFAULT_TOKEN_FILE):
+        raise RuntimeError(
+            f"Fast direct orders require today's {DEFAULT_TOKEN_FILE}; "
+            "run python generate_neo_session.py or check the 08:30 cron"
+        )
+    _session, meta = token_loaded
+    logger.info("Fast direct token OK: %s generated_at=%s", DEFAULT_TOKEN_FILE, meta.get("generated_at"))
 
 
 class LiveRunner:
@@ -268,6 +297,20 @@ class LiveRunner:
             return False
         return self.trader.state_manager.state.position_size != 0 and self.trader.live_position is not None
 
+    def _reconcile_broker_position(self) -> None:
+        if self.broker is None or self.trader is None:
+            return
+        result = reconcile_with_broker(self.broker, self.trader.live_position)
+        if result is None:
+            return
+        if result.manual_exit_detected:
+            self.trader.clear_manual_broker_exit(open_symbols=result.open_symbols)
+        elif result.partial_mismatch:
+            logger.warning(
+                "Partial broker position mismatch detected; leaving local state unchanged "
+                "for manual review"
+            )
+
     def _check_feed_health(self) -> None:
         if self.live_cfg is None or self.broker is None:
             return
@@ -392,8 +435,6 @@ class LiveRunner:
             self.bar_cache.trim_and_persist()
         if self.live_cfg is not None:
             prune_trading_log(LOG_FILE, retention_days=self.live_cfg.log_retention_days)
-        if self.trader:
-            self.trader.flatten_on_shutdown()
         if self.broker:
             try:
                 self.broker.logout()
@@ -423,7 +464,10 @@ class LiveRunner:
         )
 
         try:
-            ensure_trade_session(self.creds)
+            if self.live_cfg.fast_direct_orders:
+                _validate_fast_direct_inputs(self.live_cfg)
+            else:
+                ensure_trade_session(self.creds)
         except RuntimeError as exc:
             logger.error("Neo trade session setup failed: %s", exc)
             raise
@@ -471,16 +515,19 @@ class LiveRunner:
         except Exception as exc:
             logger.warning("Could not fetch limits: %s", exc)
 
-        try:
-            expiry = self.broker.nearest_expiry()
-            ltp = self.broker.get_index_ltp()
-            if ltp is not None:
-                self.broker.resolve_atm_legs(ltp, expiry)
-                logger.info("Pre-warmed option scrips for expiry=%s index=%.2f", expiry, ltp)
-            else:
-                logger.info("Pre-warmed expiry=%s (ATM legs will resolve on first entry tick)", expiry)
-        except Exception as exc:
-            logger.warning("Option scrip pre-warm failed: %s", exc)
+        if self.live_cfg.fast_direct_orders:
+            logger.info("Skipping option scrip pre-warm: fast direct orders use local symbol CSV")
+        else:
+            try:
+                expiry = self.broker.nearest_expiry()
+                ltp = self.broker.get_index_ltp()
+                if ltp is not None:
+                    self.broker.resolve_atm_legs(ltp, expiry)
+                    logger.info("Pre-warmed option scrips for expiry=%s index=%.2f", expiry, ltp)
+                else:
+                    logger.info("Pre-warmed expiry=%s (ATM legs will resolve on first entry tick)", expiry)
+            except Exception as exc:
+                logger.warning("Option scrip pre-warm failed: %s", exc)
 
         logger.info("Initializing strategy engine (lots=%d)...", self.live_cfg.lots)
         self.trader = LiveTrader(
@@ -495,7 +542,7 @@ class LiveRunner:
             self.trader.allow_entries = False
             self.trader.entries_disabled_reason = f"warmup not ready ({warmup_status.message})"
             logger.warning("Entries disabled until restart with sufficient warmup")
-        reconcile_with_broker(self.broker, self.trader.live_position)
+        self._reconcile_broker_position()
 
         self.aggregator = MinuteAggregator(
             self.live_cfg,
@@ -540,6 +587,7 @@ class LiveRunner:
             if self._heartbeat_counter % 60 == 0:
                 self._maybe_refresh_daily_session()
                 self._maybe_end_of_day_maintenance()
+                self._reconcile_broker_position()
                 self._log_heartbeat()
 
         self._persist_bars()
